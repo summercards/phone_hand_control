@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <meta name="theme-color" content="#0c1018">
+  <title>Phone Hand Control</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <h1>Phone Hand Control</h1>
+        <p id="connection-text">正在准备...</p>
+      </div>
+      <div id="connection-dot" class="status-dot offline"></div>
+    </header>
+
+    <section class="stage" id="stage">
+      <video id="camera" playsinline muted autoplay></video>
+      <canvas id="overlay"></canvas>
+      <div id="camera-placeholder" class="camera-placeholder">
+        <div class="hand-glyph">☝</div>
+        <p>点击“启动摄像头”后，将手掌完整放入画面</p>
+      </div>
+      <div id="tracking-badge" class="tracking-badge">未追踪</div>
+    </section>
+
+    <section class="actions">
+      <button id="start-button" class="primary" type="button">启动摄像头</button>
+      <button id="stop-button" class="secondary" type="button" disabled>停止</button>
+    </section>
+
+    <section class="metrics" aria-label="实时性能">
+      <div><span>推理</span><strong id="metric-inference">-- ms</strong></div>
+      <div><span>追踪帧率</span><strong id="metric-fps">-- Hz</strong></div>
+      <div><span>网络 RTT</span><strong id="metric-rtt">-- ms</strong></div>
+      <div><span>发送</span><strong id="metric-sent">-- Hz</strong></div>
+    </section>
+
+    <details class="settings">
+      <summary>追踪设置</summary>
+      <label>
+        <span>摄像头</span>
+        <select id="camera-select"><option value="">默认前置摄像头</option></select>
+      </label>
+      <label>
+        <span>画面镜像（更自然）</span>
+        <input id="mirror-input" type="checkbox" checked>
+      </label>
+      <label>
+        <span>左右手交换</span>
+        <input id="swap-hands-input" type="checkbox">
+      </label>
+      <label>
+        <span>计算设备</span>
+        <select id="delegate-select">
+          <option value="GPU">GPU（推荐）</option>
+          <option value="CPU">CPU（兼容）</option>
+        </select>
+      </label>
+      <label>
+        <span>发送上限</span>
+        <select id="send-fps-select">
+          <option value="60">60 FPS</option>
+          <option value="45">45 FPS</option>
+          <option value="30">30 FPS</option>
+        </select>
+      </label>
+      <label>
+        <span>检测置信度</span>
+        <input id="confidence-input" type="range" min="0.4" max="0.85" step="0.05" value="0.6">
+        <output id="confidence-output">0.60</output>
+      </label>
+      <p class="hint">建议手机横屏、身体前方 40-90 cm，手掌占画面高度约 25%-55%。</p>
+    </details>
+
+    <details class="settings">
+      <summary>诊断</summary>
+      <pre id="diagnostics">等待启动</pre>
+    </details>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

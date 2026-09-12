@@ -1,0 +1,16 @@
+import json
+import addon_utils
+import bpy
+
+addon_utils.enable("phone_hand_controller", default_set=True, persistent=True)
+settings = bpy.context.scene.phone_hand_control
+settings.control_mode = "DEMO"
+settings.mirror_x = True
+settings.position_scale = 3.0
+settings.hand_scale = 1.0
+settings.min_cutoff = 4.0
+settings.speed_boost = 0.2
+
+result = bpy.ops.phc.create_demo_rig()
+start = bpy.ops.phc.start_receiver()
+print(json.dumps({"create": list(result), "start": list(start), "objects": len(bpy.data.objects)}, ensure_ascii=False))

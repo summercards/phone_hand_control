@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.pid
+join_qr.png
+mediapipe-tasks-vision-*.tgz
+certs/
+server.stdout.log
+server.stderr.log
+_旧Blender插件副本_*/
+
