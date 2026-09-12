@@ -10,3 +10,5 @@ server.stdout.log
 server.stderr.log
 _旧Blender插件副本_*/
 
+*.blend1
+None

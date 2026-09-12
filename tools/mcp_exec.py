@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 
 def send(code: str, host: str = "127.0.0.1", port: int = 9876, timeout: float = 60.0):

@@ -44,6 +44,21 @@ HAND_CONNECTIONS = (
     (0, 17),
 )
 PALM_INDEXES = (0, 5, 9, 13, 17)
+FIXED_CAMERA_NAME = "PHC_FixedCamera"
+FIXED_SCENE_COLLECTION = "PHC_FixedScene"
+DEFAULT_CAMERA_DISTANCE = 6.5
+DEFAULT_CAMERA_LENS = 50.0
+DEFAULT_CAMERA_SENSOR = 36.0
+DEFAULT_STAGE_Z = 1.45
+DEFAULT_FRAME_WIDTH = 4.68
+DEFAULT_FRAME_HEIGHT = 2.63
+NEUTRAL_HAND_2D = (
+    (0.50, 0.78), (0.42, 0.68), (0.36, 0.60), (0.31, 0.53), (0.27, 0.47),
+    (0.48, 0.59), (0.48, 0.48), (0.48, 0.38), (0.48, 0.29),
+    (0.54, 0.57), (0.54, 0.45), (0.54, 0.34), (0.54, 0.24),
+    (0.60, 0.59), (0.60, 0.48), (0.60, 0.38), (0.60, 0.30),
+    (0.66, 0.63), (0.66, 0.53), (0.66, 0.44), (0.66, 0.37),
+)
 FINGER_CHAINS = {
     "thumb": ((1, 2), (2, 3), (3, 4)),
     "index": ((5, 6), (6, 7), (7, 8)),
@@ -252,6 +267,23 @@ def palm_center(image: tuple[float, ...]) -> Vector:
     return value / len(PALM_INDEXES)
 
 
+def camera_frame_dimensions(settings) -> tuple[float, float]:
+    camera = bpy.data.objects.get(FIXED_CAMERA_NAME)
+    if camera is None or camera.type != "CAMERA":
+        return DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT
+    camera_data = camera.data
+    lens = max(1.0, float(settings.camera_lens or camera_data.lens))
+    sensor = max(1.0, float(camera_data.sensor_width))
+    forward = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+    stage_center = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
+    distance = max(0.5, (stage_center - camera.matrix_world.translation).dot(forward))
+    width = distance * sensor / lens
+    camera_data.lens = lens
+    resolution_x = max(1, bpy.context.scene.render.resolution_x)
+    resolution_y = max(1, bpy.context.scene.render.resolution_y)
+    height = width * resolution_y / resolution_x
+    return width, height
+
 class RuntimeState:
     def __init__(self) -> None:
         self.receiver: PoseReceiver | None = None
@@ -296,9 +328,13 @@ class PHCSettings(PropertyGroup):
     right_bone: StringProperty(name="右手骨骼", default="hand.R")
     mirror_x: BoolProperty(name="镜像 X（自然自拍方向）", default=True)
     swap_hands: BoolProperty(name="交换左右手", default=False)
-    position_scale: FloatProperty(name="水平/垂直位移", default=3.0, min=0.1, max=30.0)
-    depth_scale: FloatProperty(name="深度位移", default=1.5, min=0.0, max=20.0)
-    hand_scale: FloatProperty(name="手部尺寸", default=3.0, min=0.1, max=10.0)
+    position_scale: FloatProperty(name="画面位置倍率", default=1.0, min=0.1, max=3.0)
+    depth_scale: FloatProperty(name="深度位移", default=2.4, min=0.0, max=20.0)
+    hand_scale: FloatProperty(name="深度/手部尺寸", default=3.0, min=0.1, max=10.0)
+    stage_origin_y: FloatProperty(name="固定场景 Y", default=0.0, min=-10.0, max=10.0)
+    stage_origin_z: FloatProperty(name="固定场景 Z", default=DEFAULT_STAGE_Z, min=-10.0, max=10.0)
+    camera_lens: FloatProperty(name="摄像机焦距 (mm)", default=DEFAULT_CAMERA_LENS, min=18.0, max=120.0)
+    lock_camera_view: BoolProperty(name="锁定 3D 视图到固定摄像机", default=True)
     min_cutoff: FloatProperty(name="静止稳定强度", default=1.15, min=0.05, max=10.0)
     speed_boost: FloatProperty(name="移动跟随强度", default=0.055, min=0.0, max=1.0)
     prediction_ms: FloatProperty(name="预测补偿 (ms)", default=0.0, min=0.0, max=30.0)
@@ -375,7 +411,7 @@ def _make_material(name: str, color: tuple[float, float, float, float], metallic
     material = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     material.diffuse_color = color
     material.use_nodes = True
-    principled = material.node_tree.nodes.get("Principled BSDF")
+    principled = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
     if principled:
         principled.inputs["Base Color"].default_value = color
         principled.inputs["Metallic"].default_value = metallic
@@ -392,13 +428,152 @@ def _link_object(name: str, data, collection, material=None):
     return obj
 
 
+def _move_to_collection(obj, collection) -> None:
+    for old_collection in list(obj.users_collection):
+        old_collection.objects.unlink(obj)
+    collection.objects.link(obj)
+
+
+def _link_box(name: str, location, dimensions, collection, material=None):
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    vertices = [
+        (-1.0, -1.0, -1.0), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+        (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+    ]
+    faces = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)]
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = _link_object(name, mesh, collection, material)
+    obj.location = location
+    obj.dimensions = dimensions
+    obj["phc_scene_generated"] = True
+    return obj
+
+
+def _look_at(obj, target) -> None:
+    direction = Vector(target) - obj.location
+    obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+
+def _set_viewport_camera(settings) -> None:
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            space = area.spaces.active
+            space.region_3d.view_perspective = "CAMERA"
+            space.lock_camera = settings.lock_camera_view
+            area.tag_redraw()
+
+class PHC_OT_CreateFixedScene(Operator):
+    bl_idname = "phc.create_fixed_scene"
+    bl_label = "创建 / 重建固定摄像机和场景"
+    bl_description = "创建与手机画面坐标系对齐的固定摄像机、背景、桌面和视锥边框"
+
+    def execute(self, context):
+        settings = context.scene.phone_hand_control
+        for obj in list(bpy.data.objects):
+            if obj.get("phc_scene_generated"):
+                data = obj.data
+                bpy.data.objects.remove(obj, do_unlink=True)
+                if data is not None and data.users == 0:
+                    if isinstance(data, bpy.types.Mesh):
+                        bpy.data.meshes.remove(data)
+                    elif isinstance(data, bpy.types.Camera):
+                        bpy.data.cameras.remove(data)
+                    elif isinstance(data, bpy.types.Light):
+                        bpy.data.lights.remove(data)
+        old_collection = bpy.data.collections.get(FIXED_SCENE_COLLECTION)
+        if old_collection is not None:
+            bpy.data.collections.remove(old_collection)
+
+        collection = bpy.data.collections.new(FIXED_SCENE_COLLECTION)
+        context.scene.collection.children.link(collection)
+        floor_material = _make_material("PHC_Scene_Floor", (0.035, 0.045, 0.065, 1.0), metallic=0.25, roughness=0.28)
+        table_material = _make_material("PHC_Scene_Table", (0.12, 0.16, 0.22, 1.0), metallic=0.45, roughness=0.22)
+        backdrop_material = _make_material("PHC_Scene_Backdrop", (0.025, 0.035, 0.05, 1.0), metallic=0.1, roughness=0.7)
+        frame_material = _make_material("PHC_Frame_Guide", (0.05, 0.55, 1.0, 1.0), metallic=0.0, roughness=0.2)
+        frame_shader = next(node for node in frame_material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+        frame_shader.inputs["Emission Color"].default_value = (0.02, 0.35, 1.0, 1.0)
+        frame_shader.inputs["Emission Strength"].default_value = 4.0
+
+        _link_box("PHC_Scene_Floor", (0.0, 0.0, -0.06), (12.0, 12.0, 0.12), collection, floor_material)
+        _link_box("PHC_Scene_Backdrop", (0.0, 1.55, 2.45), (8.0, 0.12, 5.0), collection, backdrop_material)
+        _link_box("PHC_Scene_Table", (0.0, -0.05, 0.60), (5.0, 2.4, 0.20), collection, table_material)
+
+        stage_y = settings.stage_origin_y
+        stage_z = settings.stage_origin_z
+        frame_width, frame_height = DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT
+        bar = 0.035
+        guide_y = stage_y + 0.06
+        _link_box("PHC_Frame_Top", (0.0, guide_y, stage_z + frame_height * 0.5), (frame_width, bar, bar), collection, frame_material)
+        _link_box("PHC_Frame_Bottom", (0.0, guide_y, stage_z - frame_height * 0.5), (frame_width, bar, bar), collection, frame_material)
+        _link_box("PHC_Frame_Left", (-frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
+        _link_box("PHC_Frame_Right", (frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
+
+        camera_data = bpy.data.cameras.new(FIXED_CAMERA_NAME + "Data")
+        camera_data.lens = settings.camera_lens
+        camera_data.sensor_width = DEFAULT_CAMERA_SENSOR
+        camera_data.clip_start = 0.05
+        camera_data.clip_end = 100.0
+        camera = bpy.data.objects.new(FIXED_CAMERA_NAME, camera_data)
+        camera["phc_generated"] = True
+        camera["phc_scene_generated"] = True
+        collection.objects.link(camera)
+        camera.location = (0.0, -DEFAULT_CAMERA_DISTANCE, stage_z)
+        _look_at(camera, (0.0, stage_y, stage_z))
+
+        key_data = bpy.data.lights.new("PHC_KeyLightData", type="AREA")
+        key_data.energy = 900.0
+        key_data.shape = "DISK"
+        key_data.size = 4.0
+        key = _link_object("PHC_KeyLight", key_data, collection)
+        key["phc_scene_generated"] = True
+        key.location = (-3.5, -4.0, 5.0)
+        _look_at(key, (0.0, stage_y, stage_z))
+
+        fill_data = bpy.data.lights.new("PHC_FillLightData", type="AREA")
+        fill_data.energy = 500.0
+        fill_data.size = 3.0
+        fill = _link_object("PHC_FillLight", fill_data, collection)
+        fill["phc_scene_generated"] = True
+        fill.location = (4.0, -2.0, 3.0)
+        _look_at(fill, (0.0, stage_y, stage_z))
+
+        context.scene.camera = camera
+        context.scene.render.resolution_x = 1920
+        context.scene.render.resolution_y = 1080
+        context.scene.render.resolution_percentage = 100
+        context.scene.render.image_settings.file_format = "PNG"
+        context.scene.render.fps = 60
+        world = context.scene.world or bpy.data.worlds.new("PHC_World")
+        context.scene.world = world
+        world.use_nodes = True
+        background = world.node_tree.nodes.get("Background")
+        if background:
+            background.inputs["Color"].default_value = (0.008, 0.012, 0.02, 1.0)
+            background.inputs["Strength"].default_value = 0.35
+
+        settings.stage_origin_y = stage_y
+        settings.stage_origin_z = stage_z
+        settings.position_scale = 1.0
+        settings.depth_scale = 2.4
+        settings.hand_scale = 3.0
+        STATE.calibration.clear()
+        for item in STATE.filters.values():
+            item.reset()
+        _set_viewport_camera(settings)
+        settings.status = "固定摄像机和场景已创建，3D 视图已锁定"
+        self.report({"INFO"}, "固定摄像机和场景已创建")
+        return {"FINISHED"}
+
 class PHC_OT_CreateDemoRig(Operator):
     bl_idname = "phc.create_demo_rig"
     bl_label = "创建 / 重建演示手模型"
     bl_description = "创建两只由 21 个 MediaPipe 关键点驱动的精细手模型"
 
     def execute(self, context):
-        old = [obj for obj in bpy.data.objects if obj.get("phc_generated")]
+        old = [obj for obj in bpy.data.objects if obj.get("phc_generated") and not obj.get("phc_scene_generated")]
         for obj in old:
             data = obj.data
             bpy.data.objects.remove(obj, do_unlink=True)
@@ -454,8 +629,9 @@ class PHC_OT_CreateDemoRig(Operator):
             palm["phc_side"] = side
             palm["phc_palm"] = True
 
-        sphere_template.hide_set(False)
-        cylinder_template.hide_set(False)
+        for side_name in ('LEFT', 'RIGHT'):
+            _apply_demo_positions(side_name, _neutral_demo_positions(side_name, context.scene.phone_hand_control))
+
         context.scene.phone_hand_control.control_mode = "DEMO"
         context.scene.phone_hand_control.status = "演示手模型已创建，点击启动接收"
         self.report({"INFO"}, "已创建精细演示手模型")
@@ -511,7 +687,7 @@ class PHC_OT_Calibrate(Operator):
                 continue
             target = settings.left_object if side == "LEFT" else settings.right_object
             if settings.control_mode == "DEMO":
-                target_location = Vector((0.0, 0.0, 0.0))
+                target_location = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
                 target_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
             elif target is not None:
                 target_location = target.location.copy()
@@ -520,10 +696,10 @@ class PHC_OT_Calibrate(Operator):
                 else:
                     target_rotation = target.rotation_euler.to_quaternion()
             else:
-                target_location = Vector((0.0, 0.0, 0.0))
+                target_location = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
                 target_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
             STATE.calibration[side] = {
-                "origin": palm_center(hand.image),
+                "origin": (Vector((0.5, 0.5, 0.0)) if settings.control_mode == "DEMO" else palm_center(hand.image)),
                 "target_location": target_location,
                 "sensor_rotation": _palm_quaternion(hand, settings.mirror_x),
                 "target_rotation": target_rotation,
@@ -544,7 +720,12 @@ def _origin_delta(hand: HandPacket, settings, calibration) -> Vector:
     reference = calibration.get("origin") if calibration else Vector((0.5, 0.5, 0.0))
     delta = current - reference
     sign = -1.0 if settings.mirror_x else 1.0
-    return Vector((sign * delta.x * settings.position_scale, -delta.z * settings.depth_scale, -delta.y * settings.position_scale))
+    frame_width, frame_height = camera_frame_dimensions(settings)
+    return Vector((
+        sign * delta.x * frame_width * settings.position_scale,
+        -delta.z * settings.depth_scale,
+        -delta.y * frame_height * settings.position_scale,
+    ))
 
 
 def _predict_hand(side: str, hand: HandPacket, timestamp: float, milliseconds: float) -> HandPacket:
@@ -569,16 +750,71 @@ def _filter_vector(key: tuple[str, int], value: Vector, timestamp: float, settin
     return filters(value, timestamp)
 
 
+def _neutral_demo_positions(side: str, settings):
+    frame_width, frame_height = camera_frame_dimensions(settings)
+    anchor = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
+    sign = -1.0 if settings.mirror_x else 1.0
+    offset = -1.05 if side == "LEFT" else 1.05
+    positions = []
+    for image_x, image_y in NEUTRAL_HAND_2D:
+        positions.append(
+            anchor
+            + Vector(
+                (
+                    offset + sign * (image_x - 0.5) * frame_width,
+                    0.0,
+                    -(image_y - 0.5) * frame_height,
+                )
+            )
+        )
+    return positions
+
+
+def _apply_demo_positions(side: str, positions) -> None:
+    tag = "L" if side == "LEFT" else "R"
+    for index, position in enumerate(positions):
+        joint = bpy.data.objects.get(f"PHC_{tag}_Joint_{index:02d}")
+        if joint is not None:
+            joint.location = position
+            joint.update_tag(refresh={"OBJECT"})
+    for start, end in HAND_CONNECTIONS:
+        bone = bpy.data.objects.get(f"PHC_{tag}_Bone_{start:02d}_{end:02d}")
+        if bone is None:
+            continue
+        vector = positions[end] - positions[start]
+        length = vector.length
+        bone.location = (positions[start] + positions[end]) * 0.5
+        if length > 1.0e-6:
+            bone.rotation_mode = "QUATERNION"
+            bone.rotation_quaternion = vector.to_track_quat("Z", "Y")
+            bone.scale = (1.0, 1.0, length)
+        bone.update_tag(refresh={"OBJECT"})
+    palm = bpy.data.objects.get(f"PHC_{tag}_Palm")
+    if palm is not None and palm.type == "MESH" and len(palm.data.vertices) == 5:
+        for vertex, index in zip(palm.data.vertices, PALM_INDEXES):
+            vertex.co = positions[index]
+        palm.data.update()
+        palm.update_tag(refresh={"DATA"})
+
 def _update_demo_hand(side: str, hand: HandPacket, timestamp: float, settings) -> None:
     tag = 'L' if side == 'LEFT' else 'R'
     calibration = STATE.calibration.get(side, {})
-    anchor = calibration.get("target_location", Vector((0.0, 0.0, 0.0)))
+    stage_anchor = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
+    anchor = calibration.get("target_location", stage_anchor)
     base = anchor + _origin_delta(hand, settings, calibration)
-    wrist_world = landmark(hand.world, 0)
+    image_reference = palm_center(hand.image)
+    world_reference = landmark(hand.world, 0)
+    frame_width, frame_height = camera_frame_dimensions(settings)
+    sign = -1.0 if settings.mirror_x else 1.0
     positions: list[Vector] = []
     for index in range(21):
-        local = (landmark(hand.world, index) - wrist_world) * settings.hand_scale
-        mapped_local = _map_world_vector(local, settings.mirror_x)
+        image_local = landmark(hand.image, index) - image_reference
+        world_local = landmark(hand.world, index) - world_reference
+        mapped_local = Vector((
+            sign * image_local.x * frame_width * settings.position_scale,
+            _map_world_vector(world_local, settings.mirror_x).y * settings.hand_scale,
+            -image_local.y * frame_height * settings.position_scale,
+        ))
         position = _filter_vector((side, index), base + mapped_local, timestamp, settings)
         positions.append(position)
         joint = bpy.data.objects.get(f"PHC_{tag}_Joint_{index:02d}")
@@ -753,6 +989,12 @@ class PHC_PT_Main(Panel):
             row.operator("phc.stop_receiver", icon="PAUSE")
         row.operator("phc.calibrate", text="中立位", icon="ORIENTATION_GIMBAL")
 
+        scene_box = layout.box()
+        scene_box.label(text="固定摄像机与场景")
+        scene_box.operator("phc.create_fixed_scene", icon="CAMERA_DATA")
+        scene_box.prop(settings, "camera_lens")
+        scene_box.prop(settings, "lock_camera_view")
+
         box = layout.box()
         box.label(text="模型驱动")
         box.prop(settings, "control_mode", expand=True)
@@ -796,6 +1038,7 @@ CLASSES = (
     PHC_OT_StartReceiver,
     PHC_OT_StopReceiver,
     PHC_OT_ResetCalibration,
+    PHC_OT_CreateFixedScene,
     PHC_OT_CreateDemoRig,
     PHC_OT_Calibrate,
     PHC_PT_Main,
@@ -818,15 +1061,3 @@ def unregister():
     del bpy.types.Scene.phone_hand_control
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
-
-
-
-
-
-
-
-
-
-
-
-

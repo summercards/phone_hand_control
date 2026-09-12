@@ -45,7 +45,13 @@ if (-not (Test-Path ".\web\vendor\mediapipe\hand_landmarker.task")) {
 Write-Step "2/4 尝试自动启动 Blender 接收器"
 if (-not $NoBlender -and (Test-LocalPort 9876)) {
     try {
-        & $Python .\tools\mcp_exec.py .\tools\blender_autostart.py --timeout 60 | Out-Null; Write-Host "Blender 接收器已启动。" -ForegroundColor Green
+        $mcpOutput = & $Python .\tools\mcp_exec.py .\tools\blender_autostart.py --timeout 60 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Blender 接收器已启动。" -ForegroundColor Green
+        } else {
+            $mcpOutput | Out-Host
+            Write-Host "Blender 自动连接失败，请在 Blender 的 Phone Hand 侧栏手动点击“启动手机手部接收”。" -ForegroundColor Yellow
+        }
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Blender 自动连接失败，请在 Blender 的 Phone Hand 侧栏手动点击“启动手机手部接收”。" -ForegroundColor Yellow
         }

@@ -11,20 +11,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 from protocol import PoseHand, PosePacket, pack_udp_pose  # noqa: E402
 
+HAND_TEMPLATE = (
+    (0.50, 0.78), (0.42, 0.68), (0.36, 0.60), (0.31, 0.53), (0.27, 0.47),
+    (0.48, 0.59), (0.48, 0.48), (0.48, 0.38), (0.48, 0.29),
+    (0.54, 0.57), (0.54, 0.45), (0.54, 0.34), (0.54, 0.24),
+    (0.60, 0.59), (0.60, 0.48), (0.60, 0.38), (0.60, 0.30),
+    (0.66, 0.63), (0.66, 0.53), (0.66, 0.44), (0.66, 0.37),
+)
 
-def build_landmarks(t: float) -> tuple[tuple[float, ...], tuple[float, ...]]:
+
+def build_landmarks(t: float, hand_offset: float = 0.0) -> tuple[tuple[float, ...], tuple[float, ...]]:
     image = []
     world = []
-    cx = 0.5 + 0.12 * math.sin(t * 2.0)
-    cy = 0.55 + 0.06 * math.cos(t * 1.7)
-    for index in range(21):
-        angle = index * 0.43
-        radius = 0.03 + (index % 5) * 0.003
-        x = cx + radius * math.cos(angle)
-        y = cy + radius * math.sin(angle)
-        z = 0.01 * math.sin(t * 3.0 + index * 0.2)
-        image.extend((x, y, z))
-        world.extend(((index % 5) * 0.015 - 0.03, -0.02 + (index // 5) * 0.025, z))
+    shift_x = hand_offset + 0.14 * math.sin(t * 1.8)
+    shift_y = 0.035 * math.cos(t * 1.3)
+    for index, (x, y) in enumerate(HAND_TEMPLATE):
+        image_x = x + shift_x
+        image_y = y + shift_y
+        image_z = 0.008 * math.sin(t * 2.2 + index * 0.25)
+        image.extend((image_x, image_y, image_z))
+        world.extend((
+            (index % 5 - 2) * 0.018,
+            -(index // 5) * 0.035,
+            image_z,
+        ))
     return tuple(image), tuple(world)
 
 
@@ -44,11 +54,12 @@ def main() -> int:
     try:
         while time.monotonic() - start < args.seconds:
             elapsed = time.monotonic() - start
-            image, world = build_landmarks(elapsed)
             hands = []
             if args.side in {"left", "both"}:
+                image, world = build_landmarks(elapsed, -0.18)
                 hands.append(PoseHand(1, 1, 1.0, image, world))
             if args.side in {"right", "both"}:
+                image, world = build_landmarks(elapsed, 0.18)
                 hands.append(PoseHand(2, 1, 1.0, image, world))
             packet = PosePacket(sequence, elapsed * 1000.0, tuple(hands))
             sock.sendto(pack_udp_pose(packet, time.monotonic_ns()), (args.host, args.port))

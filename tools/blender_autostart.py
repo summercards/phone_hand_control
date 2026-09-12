@@ -40,6 +40,9 @@ has_demo_rig = any(
 if not has_demo_rig:
     bpy.ops.phc.create_demo_rig()
 
+bpy.ops.phc.create_fixed_scene()
+settings = bpy.context.scene.phone_hand_control
+
 if module.STATE.receiver is None or not module.STATE.receiver.is_alive():
     bpy.ops.phc.start_receiver()
 
@@ -47,6 +50,7 @@ print(json.dumps({
     "blender": bpy.app.version_string,
     "addon_source": str(module_path),
     "demo_rig": True,
+    "camera": bpy.context.scene.camera.name if bpy.context.scene.camera else None,
     "receiver_running": module.STATE.receiver is not None and module.STATE.receiver.is_alive(),
     "udp_port": settings.receive_port,
 }, ensure_ascii=False))
