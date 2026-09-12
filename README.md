@@ -298,3 +298,13 @@ Bridge → Blender：魔数 `PHC1`，包含 PC 单调时钟纳秒值和相同关
 
 
 
+
+## 侧边栏没有 Phone Hand
+
+插件通过 Blender 用户插件目录中的目录链接直接指向本项目源码，不会复制工程内容。若当前已打开 Blender 时仍看不到：
+
+1. 关闭并重新打开 Blender；
+2. 打开 `hand_control_fixed_scene.blend`；
+3. 在 3D 视图按 `N`；
+4. 点击右侧竖排标签中的 `Phone Hand`。
+
