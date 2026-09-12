@@ -298,6 +298,9 @@ class RuntimeState:
         self.last_status = "未启动"
         self.target_baselines: dict[str, tuple[Vector, Quaternion]] = {}
         self.motion_history: dict[str, tuple[tuple[float, ...], float]] = {}
+        self.pinch_down: dict[str, bool] = {"LEFT": False, "RIGHT": False}
+        self.tracked_sides: set[str] = set()
+        self.last_interaction_time = 0.0
         self.finger_bindings: dict[str, dict[str, dict[str, object]]] = {}
 
 STATE = RuntimeState()
@@ -335,6 +338,9 @@ class PHCSettings(PropertyGroup):
     stage_origin_z: FloatProperty(name="固定场景 Z", default=DEFAULT_STAGE_Z, min=-10.0, max=10.0)
     camera_lens: FloatProperty(name="摄像机焦距 (mm)", default=DEFAULT_CAMERA_LENS, min=18.0, max=120.0)
     lock_camera_view: BoolProperty(name="锁定 3D 视图到固定摄像机", default=True)
+    hide_untracked_hands: BoolProperty(name="隐藏未捕捉的手", default=True)
+    interaction_enabled: BoolProperty(name="启用手部交互", default=True)
+    pinch_threshold: FloatProperty(name="捏合阈值", default=0.060, min=0.020, max=0.150)
     min_cutoff: FloatProperty(name="静止稳定强度", default=1.15, min=0.05, max=10.0)
     speed_boost: FloatProperty(name="移动跟随强度", default=0.055, min=0.0, max=1.0)
     prediction_ms: FloatProperty(name="预测补偿 (ms)", default=0.0, min=0.0, max=30.0)
@@ -450,6 +456,18 @@ def _link_box(name: str, location, dimensions, collection, material=None):
     return obj
 
 
+def _link_text(name: str, body: str, location, collection, material=None):
+    curve = bpy.data.curves.new(name + "Curve", type="FONT")
+    curve.body = body
+    curve.align_x = "CENTER"
+    curve.align_y = "CENTER"
+    curve.size = 0.16
+    obj = _link_object(name, curve, collection, material)
+    obj.location = location
+    obj["phc_scene_generated"] = True
+    return obj
+
+
 def _look_at(obj, target) -> None:
     direction = Vector(target) - obj.location
     obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
@@ -510,6 +528,36 @@ class PHC_OT_CreateFixedScene(Operator):
         _link_box("PHC_Frame_Bottom", (0.0, guide_y, stage_z - frame_height * 0.5), (frame_width, bar, bar), collection, frame_material)
         _link_box("PHC_Frame_Left", (-frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
         _link_box("PHC_Frame_Right", (frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
+
+        interaction_specs = (
+            ("Toggle", "TOGGLE", (-1.42, -0.28, 1.05), (0.42, 0.42, 0.30), (1.0, 0.22, 0.05, 1.0)),
+            ("Bounce", "BOUNCE", (0.0, -0.28, 1.05), (0.46, 0.46, 0.24), (0.10, 0.95, 0.45, 1.0)),
+            ("Spin", "SPIN", (1.42, -0.28, 1.10), (0.46, 0.46, 0.46), (0.10, 0.48, 1.0, 1.0)),
+        )
+        for label, interaction_type, location, dimensions, color in interaction_specs:
+            material = _make_material("PHC_Interactive_" + label, color, metallic=0.2, roughness=0.24)
+            shader = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+            shader.inputs["Emission Color"].default_value = color
+            shader.inputs["Emission Strength"].default_value = 0.35
+            if interaction_type == "SPIN":
+                bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=0.24, location=location)
+                obj = bpy.context.active_object
+                obj.name = "PHC_Interactive_" + label
+                _move_to_collection(obj, collection)
+                obj["phc_generated"] = True
+                obj["phc_scene_generated"] = True
+                obj.data.materials.append(material)
+            else:
+                obj = _link_box("PHC_Interactive_" + label, location, dimensions, collection, material)
+            obj["phc_interactive"] = True
+            obj["phc_interaction_type"] = interaction_type
+            obj["phc_interaction_radius"] = 0.38
+            obj["phc_base_location"] = list(location)
+            obj["phc_active"] = False
+            obj["phc_bounce_start"] = -10.0
+            obj["phc_last_update"] = 0.0
+            text_obj = _link_text("PHC_Label_" + label, label.upper(), (location[0], location[1] - 0.02, location[2] + 0.46), collection, material)
+            text_obj.rotation_euler.x = math.radians(90.0)
 
         camera_data = bpy.data.cameras.new(FIXED_CAMERA_NAME + "Data")
         camera_data.lens = settings.camera_lens
@@ -631,6 +679,9 @@ class PHC_OT_CreateDemoRig(Operator):
 
         for side_name in ('LEFT', 'RIGHT'):
             _apply_demo_positions(side_name, _neutral_demo_positions(side_name, context.scene.phone_hand_control))
+        if context.scene.phone_hand_control.hide_untracked_hands:
+            _set_demo_hand_visible('LEFT', False)
+            _set_demo_hand_visible('RIGHT', False)
 
         context.scene.phone_hand_control.control_mode = "DEMO"
         context.scene.phone_hand_control.status = "演示手模型已创建，点击启动接收"
@@ -796,7 +847,78 @@ def _apply_demo_positions(side: str, positions) -> None:
         palm.data.update()
         palm.update_tag(refresh={"DATA"})
 
+def _set_demo_hand_visible(side: str, visible: bool) -> None:
+    tag = "L" if side == "LEFT" else "R"
+    for obj in bpy.data.objects:
+        if obj.get("phc_side") != tag or obj.get("phc_palm") is None and obj.get("phc_joint") is None and obj.get("phc_bone_a") is None:
+            continue
+        obj.hide_render = not visible
+        try:
+            obj.hide_set(not visible)
+        except RuntimeError:
+            pass
+
+
+def _pinch_is_down(hand: HandPacket, threshold: float) -> bool:
+    thumb_tip = landmark(hand.image, 4)
+    index_tip = landmark(hand.image, 8)
+    return (thumb_tip - index_tip).length <= threshold
+
+
+def _trigger_interaction(obj, now: float) -> None:
+    interaction = str(obj.get("phc_interaction_type", ""))
+    if interaction == "TOGGLE":
+        obj["phc_active"] = not bool(obj.get("phc_active", False))
+    elif interaction == "BOUNCE":
+        obj["phc_bounce_start"] = now
+    elif interaction == "SPIN":
+        obj["phc_active"] = not bool(obj.get("phc_active", False))
+
+
+def _update_interactions(hands, settings, now: float) -> None:
+    if not settings.interaction_enabled:
+        return
+    index_tips = []
+    for side, hand in hands:
+        joint = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_08")
+        if joint is not None:
+            index_tips.append(joint.location.copy())
+    for obj in [item for item in bpy.data.objects if item.get("phc_interactive")]:
+        base_values = obj.get("phc_base_location", [obj.location.x, obj.location.y, obj.location.z])
+        base = Vector(base_values)
+        last_update = float(obj.get("phc_last_update", now))
+        elapsed = max(0.0, min(0.1, now - last_update))
+        obj["phc_last_update"] = now
+        radius = float(obj.get("phc_interaction_radius", 0.32))
+        hovered = False
+        for point in index_tips:
+            if (point - obj.location).length <= radius:
+                hovered = True
+                break
+        interaction = str(obj.get("phc_interaction_type", ""))
+        active = bool(obj.get("phc_active", False))
+        if interaction == "BOUNCE":
+            start = float(obj.get("phc_bounce_start", -10.0))
+            progress = (now - start) / 0.65
+            if 0.0 <= progress <= 1.0:
+                obj.location = base + Vector((0.0, 0.0, 0.38 * math.sin(math.pi * progress)))
+            else:
+                obj.location = base
+        elif interaction == "TOGGLE":
+            obj.location = base + Vector((0.0, 0.0, 0.16 if active else 0.0))
+        elif interaction == "SPIN":
+            if active:
+                obj.rotation_euler.z += elapsed * 2.8
+            obj.location = base + Vector((0.0, 0.0, 0.10 if hovered else 0.0))
+        if obj.data is not None and obj.data.materials:
+            material = obj.data.materials[0]
+            shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None) if material.use_nodes else None
+            if shader is not None:
+                shader.inputs["Emission Strength"].default_value = 7.0 if hovered else (2.5 if active else 0.35)
+
+
 def _update_demo_hand(side: str, hand: HandPacket, timestamp: float, settings) -> None:
+    _set_demo_hand_visible(side, True)
     tag = 'L' if side == 'LEFT' else 'R'
     calibration = STATE.calibration.get(side, {})
     stage_anchor = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
@@ -935,20 +1057,44 @@ def controller_timer():
             span = STATE.receive_times[-1] - STATE.receive_times[0]
             if span > 0.0:
                 STATE.measured_hz = (len(STATE.receive_times) - 1) / span
+        tracked_hands = []
         for side in ("LEFT", "RIGHT"):
             hand = _select_hand(packet, side, settings.swap_hands)
             if hand is None:
+                STATE.pinch_down[side] = False
+                if settings.control_mode == "DEMO" and settings.hide_untracked_hands:
+                    _set_demo_hand_visible(side, False)
                 continue
             hand = _predict_hand(side, hand, now, settings.prediction_ms)
+            tracked_hands.append((side, hand))
             if settings.control_mode == "DEMO":
+                _set_demo_hand_visible(side, True)
                 _update_demo_hand(side, hand, now, settings)
             elif settings.control_mode == "OBJECT":
                 _update_object_hand(side, hand, settings)
             elif settings.control_mode == "ARMATURE":
                 _update_armature_hand(side, hand, settings)
+        STATE.tracked_sides = {side for side, _hand in tracked_hands}
+        if settings.control_mode == "DEMO" and settings.interaction_enabled:
+            for side, hand in tracked_hands:
+                pinch = _pinch_is_down(hand, settings.pinch_threshold)
+                if pinch and not STATE.pinch_down[side]:
+                    tip = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_08")
+                    if tip is not None:
+                        for obj in (item for item in bpy.data.objects if item.get("phc_interactive")):
+                            if (tip.location - obj.location).length <= float(obj.get("phc_interaction_radius", 0.32)):
+                                _trigger_interaction(obj, now)
+                STATE.pinch_down[side] = pinch
+            _update_interactions(tracked_hands, settings, now)
         STATE.last_status = f"已接收 {len(packet.hands)} 只手"
     elif STATE.last_packet_ns and (now_ns - STATE.last_packet_ns) / 1_000_000 > settings.timeout_ms:
         STATE.last_status = "等待手机数据超过超时时间"
+        if settings.control_mode == "DEMO" and settings.hide_untracked_hands:
+            _set_demo_hand_visible("LEFT", False)
+            _set_demo_hand_visible("RIGHT", False)
+        STATE.tracked_sides.clear()
+        STATE.pinch_down["LEFT"] = False
+        STATE.pinch_down["RIGHT"] = False
 
     if now - STATE.last_ui_update >= 0.25:
         age_ms = (now_ns - STATE.last_packet_ns) / 1_000_000 if STATE.last_packet_ns else None
@@ -961,6 +1107,21 @@ def controller_timer():
         STATE.last_ui_update = now
         _tag_redraw()
     return 1.0 / 60.0
+
+
+class PHC_OT_ResetInteractions(Operator):
+    bl_idname = "phc.reset_interactions"
+    bl_label = "重置交互物体"
+    bl_description = "恢复场景中交互物体的初始位置和状态"
+
+    def execute(self, context):
+        for obj in (item for item in bpy.data.objects if item.get("phc_interactive")):
+            base = obj.get("phc_base_location", [obj.location.x, obj.location.y, obj.location.z])
+            obj.location = Vector(base)
+            obj["phc_active"] = False
+            obj["phc_bounce_start"] = -10.0
+        self.report({"INFO"}, "交互物体已重置")
+        return {"FINISHED"}
 
 
 class PHC_PT_Main(Panel):
@@ -994,6 +1155,10 @@ class PHC_PT_Main(Panel):
         scene_box.operator("phc.create_fixed_scene", icon="CAMERA_DATA")
         scene_box.prop(settings, "camera_lens")
         scene_box.prop(settings, "lock_camera_view")
+        scene_box.prop(settings, "hide_untracked_hands")
+        scene_box.prop(settings, "interaction_enabled")
+        scene_box.prop(settings, "pinch_threshold")
+        scene_box.operator("phc.reset_interactions", icon="LOOP_BACK")
 
         box = layout.box()
         box.label(text="模型驱动")
@@ -1041,6 +1206,7 @@ CLASSES = (
     PHC_OT_CreateFixedScene,
     PHC_OT_CreateDemoRig,
     PHC_OT_Calibrate,
+    PHC_OT_ResetInteractions,
     PHC_PT_Main,
 )
 
