@@ -596,13 +596,11 @@ class PHC_OT_CreateFixedScene(Operator):
             (8.0, 1.0, 5.0),
             roughness=0.76,
         )
-        platform_material = _make_material("PHC_Simple_Platform", (0.70, 0.74, 0.79, 1.0), metallic=0.05, roughness=0.42)
 
         _link_box("PHC_Scene_Floor", (0.0, 0.0, -0.06), (12.0, 12.0, 0.12), collection, floor_material)
         _link_box("PHC_Scene_Backdrop", (0.0, 1.55, 2.45), (8.0, 0.12, 5.0), collection, wall_material)
         _link_box("PHC_Scene_Wall_Left", (-2.22, 0.38, 2.0), (0.18, 3.6, 4.0), collection, wall_material)
         _link_box("PHC_Scene_Wall_Right", (2.22, 0.38, 2.0), (0.18, 3.6, 4.0), collection, wall_material)
-        _link_box("PHC_Scene_Platform", (0.0, -0.05, 0.30), (3.8, 1.9, 0.60), collection, platform_material)
 
         stage_y = settings.stage_origin_y
         stage_z = settings.stage_origin_z
@@ -615,8 +613,8 @@ class PHC_OT_CreateFixedScene(Operator):
         _link_box("PHC_Frame_Right", (frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
 
         interaction_specs = (
-            ("Toggle", "TOGGLE", (-1.28, -0.18, 0.82), (0.42, 0.42, 0.44), (1.0, 0.30, 0.08, 1.0)),
-            ("Bounce", "BOUNCE", (1.28, -0.18, 0.82), (0.46, 0.46, 0.44), (0.12, 0.82, 0.42, 1.0)),
+            ("Toggle", "TOGGLE", (-1.28, -0.18, 0.22), (0.42, 0.42, 0.44), (1.0, 0.30, 0.08, 1.0)),
+            ("Bounce", "BOUNCE", (1.28, -0.18, 0.22), (0.46, 0.46, 0.44), (0.12, 0.82, 0.42, 1.0)),
         )
         for label, interaction_type, location, dimensions, color in interaction_specs:
             material = _make_material("PHC_Interactive_" + label, color, metallic=0.12, roughness=0.28)
@@ -641,11 +639,11 @@ class PHC_OT_CreateFixedScene(Operator):
         punch_shader = next(node for node in punch_material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
         punch_shader.inputs["Emission Color"].default_value = (1.0, 0.40, 0.05, 1.0)
         punch_shader.inputs["Emission Strength"].default_value = 0.28
-        punch_base = _link_box("PHC_PunchBase", (0.0, -0.16, 0.67), (0.18, 0.18, 0.14), collection, punch_material)
+        punch_base = _link_box("PHC_PunchBase", (0.0, -0.16, 0.07), (0.18, 0.18, 0.14), collection, punch_material)
         punch_base["phc_collision_shape"] = "BOX"
         punch_base["phc_collision_half_extents"] = [0.09, 0.09, 0.07]
 
-        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=0.25, location=(0.0, -0.16, 1.72))
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=0.25, location=(0.0, -0.16, 1.12))
         punch_ball = bpy.context.active_object
         punch_ball.name = "PHC_PunchBall"
         _move_to_collection(punch_ball, collection)
@@ -655,7 +653,7 @@ class PHC_OT_CreateFixedScene(Operator):
         punch_ball["phc_interaction_type"] = "PUNCH_BALL"
         punch_ball["phc_collision_shape"] = "SPHERE"
         punch_ball["phc_collision_radius"] = 0.25
-        punch_ball["phc_base_location"] = [0.0, -0.16, 1.72]
+        punch_ball["phc_base_location"] = [0.0, -0.16, 1.12]
         punch_ball["phc_rest_offset"] = [0.0, 0.0, 1.17]
         punch_ball["phc_spring_stiffness"] = 45.0
         punch_ball["phc_spring_damping"] = 7.5
@@ -667,14 +665,14 @@ class PHC_OT_CreateFixedScene(Operator):
         punch_ball["phc_angular_velocity"] = [0.0, 0.0, 0.0]
         punch_ball.data.materials.append(punch_material)
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=0.045, depth=1.0, location=(0.0, -0.16, 1.195))
+        bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=0.045, depth=1.0, location=(0.0, -0.16, 0.595))
         punch_rod = bpy.context.active_object
         punch_rod.name = "PHC_PunchRod"
         _move_to_collection(punch_rod, collection)
         punch_rod["phc_generated"] = True
         punch_rod["phc_scene_generated"] = True
         punch_rod.data.materials.append(punch_material)
-        punch_label = _link_text("PHC_Label_Punch", "PUNCH", (0.0, -0.18, 2.08), collection, punch_material)
+        punch_label = _link_text("PHC_Label_Punch", "PUNCH", (0.0, -0.18, 1.48), collection, punch_material)
         punch_label.rotation_euler.x = math.radians(90.0)
 
         camera_data = bpy.data.cameras.new(FIXED_CAMERA_NAME + "Data")
