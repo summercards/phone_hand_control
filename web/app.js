@@ -39,12 +39,19 @@ const HAND_CONNECTIONS = [
   [0, 17],
 ];
 
+const APP_VERSION = "20260913b";
+if (localStorage.getItem("phc.version") !== APP_VERSION) {
+  localStorage.setItem("phc.version", APP_VERSION);
+  localStorage.setItem("phc.delegate", "CPU");
+  localStorage.setItem("phc.confidence", "0.5");
+}
+
 const settings = {
   mirror: localStorage.getItem("phc.mirror") !== "false",
   swapHands: localStorage.getItem("phc.swapHands") === "true",
-  delegate: localStorage.getItem("phc.delegate") || "GPU",
+  delegate: localStorage.getItem("phc.delegate") || "CPU",
   sendFps: Number(localStorage.getItem("phc.sendFps") || 60),
-  confidence: Number(localStorage.getItem("phc.confidence") || 0.6),
+  confidence: Number(localStorage.getItem("phc.confidence") || 0.5),
   cameraId: localStorage.getItem("phc.cameraId") || "",
 };
 
@@ -71,6 +78,8 @@ const state = {
   lastResult: null,
   token: new URLSearchParams(location.search).get("token") || "",
   lastTelemetryAt: 0,
+  modelBuffer: null,
+  modelLoadPromise: null,
 };
 
 function setConnection(mode, text) {
@@ -163,16 +172,58 @@ async function refreshCameras() {
   }
 }
 
-async function createLandmarker() {
-  if (state.landmarker) {
-    state.landmarker.close();
-    state.landmarker = null;
-  }
-  const vision = await FilesetResolver.forVisionTasks("./vendor/mediapipe/wasm");
-  const options = {
+function withTimeout(promise, milliseconds, label) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} 超时（${milliseconds} ms）`)), milliseconds);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+async function loadModelBuffer() {
+  if (state.modelBuffer) return state.modelBuffer;
+  if (state.modelLoadPromise) return state.modelLoadPromise;
+  state.modelLoadPromise = (async () => {
+    const response = await fetch("./vendor/mediapipe/hand_landmarker.task", { cache: "force-cache" });
+    if (!response.ok) throw new Error(`手部模型下载失败：HTTP ${response.status}`);
+    const total = Number(response.headers.get("Content-Length") || 0);
+    if (!response.body) {
+      const buffer = new Uint8Array(await response.arrayBuffer());
+      state.modelBuffer = buffer;
+      return buffer;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (total) {
+        setConnection("connecting", `正在下载手部模型 ${Math.round(received / total * 100)}%`);
+      }
+    }
+    const buffer = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+    state.modelBuffer = buffer;
+    return buffer;
+  })().catch((error) => {
+    state.modelLoadPromise = null;
+    throw error;
+  });
+  return state.modelLoadPromise;
+}
+
+function handLandmarkerOptions(vision, delegate) {
+  return {
     baseOptions: {
-      modelAssetPath: "./vendor/mediapipe/hand_landmarker.task",
-      delegate: settings.delegate,
+      modelAssetBuffer: state.modelBuffer,
+      delegate,
     },
     runningMode: "VIDEO",
     numHands: MAX_HANDS,
@@ -180,20 +231,46 @@ async function createLandmarker() {
     minHandPresenceConfidence: settings.confidence,
     minTrackingConfidence: settings.confidence,
   };
-  try {
-    state.landmarker = await HandLandmarker.createFromOptions(vision, options);
-  } catch (error) {
-    if (settings.delegate !== "CPU") {
-      console.warn("GPU delegate failed, retrying CPU", error);
-      options.baseOptions.delegate = "CPU";
-      state.landmarker = await HandLandmarker.createFromOptions(vision, options);
-      settings.delegate = "CPU";
-      elements.delegate.value = "CPU";
-      persistSettings();
-    } else {
-      throw error;
-    }
+}
+
+async function createLandmarker() {
+  if (state.landmarker) {
+    state.landmarker.close();
+    state.landmarker = null;
   }
+  setConnection("connecting", "正在加载 MediaPipe WASM...");
+  const vision = await withTimeout(
+    FilesetResolver.forVisionTasks("./vendor/mediapipe/wasm"),
+    15000,
+    "MediaPipe WASM 加载",
+  );
+  await loadModelBuffer();
+  const preferred = settings.delegate === "CPU" ? "CPU" : "GPU";
+  setConnection("connecting", `正在初始化手部模型（${preferred}）...`);
+  try {
+    state.landmarker = await withTimeout(
+      HandLandmarker.createFromOptions(vision, handLandmarkerOptions(vision, preferred)),
+      preferred === "GPU" ? 18000 : 25000,
+      `${preferred} 手部模型初始化`,
+    );
+  } catch (error) {
+    console.warn(`${preferred} delegate failed or timed out, retrying CPU`, error);
+    if (state.landmarker) {
+      try { state.landmarker.close(); } catch (_) {}
+      state.landmarker = null;
+    }
+    if (preferred === "CPU") throw error;
+    setConnection("connecting", "GPU 初始化失败，正在回退 CPU...");
+    state.landmarker = await withTimeout(
+      HandLandmarker.createFromOptions(vision, handLandmarkerOptions(vision, "CPU")),
+      25000,
+      "CPU 手部模型初始化",
+    );
+    settings.delegate = "CPU";
+    elements.delegate.value = "CPU";
+    persistSettings();
+  }
+  setConnection("connecting", "手部模型已加载，正在请求摄像头...");
 }
 
 async function startCamera() {
@@ -407,6 +484,8 @@ function updateMetrics(now) {
           rtt_ms: Number(state.rttMs.toFixed(2)),
           dropped: state.dropped,
           hands: state.handCount,
+          model_loaded: Boolean(state.landmarker),
+          delegate: settings.delegate,
         },
       });
     }
@@ -416,6 +495,8 @@ function updateMetrics(now) {
 function updateDiagnostics(prefix = "") {
   const lines = [];
   if (prefix) lines.push(prefix);
+  lines.push(`模型已加载: ${state.landmarker ? "是" : "否"}`);
+  lines.push(`计算设备: ${settings.delegate}`);
   lines.push(`协议: PHCW v${PROTOCOL_VERSION}`);
   lines.push(`安全上下文: ${window.isSecureContext ? "是" : "否"}`);
   lines.push(`WebSocket: ${state.wsConnected ? "已连接" : "未连接"}`);
@@ -495,5 +576,9 @@ elements.cameraSelect.addEventListener("change", async () => {
 
 window.addEventListener("pagehide", stopCamera);
 applySettingsToUi();
+loadModelBuffer().catch((error) => console.warn("model preload failed", error));
 connectWebSocket();
+if (new URLSearchParams(location.search).get("autostart") === "1") {
+  setTimeout(() => elements.start.click(), 600);
+}
 updateDiagnostics();

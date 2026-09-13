@@ -191,10 +191,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(stat.st_size))
-        self.send_header(
-            "Cache-Control",
-            "no-cache" if path.suffix == ".html" else "public, max-age=86400",
-        )
+        cache_control = "no-store" if path.suffix.lower() in {".html", ".js", ".mjs", ".css"} else "public, max-age=86400"
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         if not send_body:
             return
@@ -464,7 +462,11 @@ def make_qr(url: str) -> Path | None:
     qr = qrcode.QRCode(version=None, box_size=8, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    qr.make_image(fill_color="#111827", back_color="white").save(output)
+    image = qr.make_image(fill_color="#111827", back_color="white").convert("RGB")
+    import io
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    output.write_bytes(buffer.getvalue())
     return output
 
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <meta name="theme-color" content="#0c1018">
   <title>Phone Hand Control</title>
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=20260913c">
 </head>
 <body>
   <main class="app">
@@ -70,8 +70,8 @@
       </label>
       <label>
         <span>检测置信度</span>
-        <input id="confidence-input" type="range" min="0.4" max="0.85" step="0.05" value="0.6">
-        <output id="confidence-output">0.60</output>
+        <input id="confidence-input" type="range" min="0.4" max="0.85" step="0.05" value="0.5">
+        <output id="confidence-output">0.50</output>
       </label>
       <p class="hint">建议手机横屏、身体前方 40-90 cm，手掌占画面高度约 25%-55%。</p>
     </details>
@@ -81,6 +81,6 @@
       <pre id="diagnostics">等待启动</pre>
     </details>
   </main>
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=20260913c"></script>
 </body>
 </html>
