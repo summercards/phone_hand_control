@@ -26,7 +26,40 @@ function Test-LocalPort([int]$Port) {
     }
 }
 
+function Stop-ExistingBridge() {
+    $connection = Get-NetTCPConnection -State Listen -LocalPort 8443 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($connection) {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($connection.OwningProcess)"
+        if ($processInfo.CommandLine -match "phc_server\.py") {
+            Stop-Process -Id $connection.OwningProcess -Force
+            Write-Host "已关闭旧 Bridge 服务。" -ForegroundColor DarkGray
+        }
+    }
+    $windows = Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -eq "powershell.exe" -and $_.CommandLine -match "run\.ps1"
+    }
+    foreach ($window in $windows) {
+        Stop-Process -Id $window.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 700
+}
+
+function Ensure-AddonLink() {
+    $source = Join-Path $ProjectRoot "blender_addon\phone_hand_controller"
+    $blenderRoot = Join-Path $env:APPDATA "Blender Foundation\Blender"
+    if (-not (Test-Path $blenderRoot)) { return }
+    foreach ($versionDir in Get-ChildItem $blenderRoot -Directory) {
+        $destination = Join-Path $versionDir.FullName "scripts\addons\phone_hand_controller"
+        if (Test-Path $destination) { continue }
+        $parent = Split-Path -Parent $destination
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        New-Item -ItemType Junction -Path $destination -Target $source | Out-Null
+        Write-Host "已创建 Blender $($versionDir.Name) 插件链接。" -ForegroundColor DarkGray
+    }
+}
+
 Write-Step "1/4 检查运行环境"
+Ensure-AddonLink
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $Python)) {
     Write-Host "首次运行，正在安装依赖和 MediaPipe，请稍候..." -ForegroundColor Yellow
@@ -42,39 +75,26 @@ if (-not (Test-Path ".\web\vendor\mediapipe\hand_landmarker.task")) {
     throw "MediaPipe 模型安装失败，请查看上方错误。"
 }
 
-Write-Step "2/4 尝试自动启动 Blender 接收器"
+Write-Step "2/4 重载 Blender 插件并创建固定场景"
 if (-not $NoBlender -and (Test-LocalPort 9876)) {
     try {
-        $mcpOutput = & $Python .\tools\mcp_exec.py .\tools\blender_autostart.py --timeout 60 2>&1
+        $mcpOutput = & $Python .\tools\mcp_exec.py .\tools\blender_autostart.py --timeout 90 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "Blender 接收器已启动。" -ForegroundColor Green
+            Write-Host "Blender 插件已重载，固定场景和接收器已就绪。" -ForegroundColor Green
         } else {
             $mcpOutput | Out-Host
-            Write-Host "Blender 自动连接失败，请在 Blender 的 Phone Hand 侧栏手动点击“启动手机手部接收”。" -ForegroundColor Yellow
-        }
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "Blender 自动连接失败，请在 Blender 的 Phone Hand 侧栏手动点击“启动手机手部接收”。" -ForegroundColor Yellow
+            Write-Host "Blender 自动连接失败，请在 Blender 的 Phone Hand 侧栏手动启动接收器。" -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "未连接到 Blender MCP，请手动点击 Blender 侧栏中的“启动手机手部接收”。" -ForegroundColor Yellow
+        Write-Host "未连接到 Blender MCP，请手动启动 Phone Hand 接收器。" -ForegroundColor Yellow
     }
 } else {
-    Write-Host "未检测到 Blender MCP。请打开 Blender，并在 Phone Hand 侧栏点击“启动手机手部接收”。" -ForegroundColor Yellow
+    Write-Host "未检测到 Blender MCP。请打开 Blender，再重新双击一键启动。" -ForegroundColor Yellow
 }
 
-Write-Step "3/4 检查手机桥接服务"
+Write-Step "3/4 重启手机桥接服务"
+Stop-ExistingBridge
 $qrPath = Join-Path $ProjectRoot "join_qr.png"
-if (Test-LocalPort 8443) {
-    Write-Host "服务已经在运行。" -ForegroundColor Green
-    if (Test-Path $qrPath) {
-        if (-not $NoBrowser) { Start-Process -FilePath $qrPath }
-    } else {
-        Write-Host "未找到二维码。请关闭标题为“Phone Hand Control 服务”的旧窗口，然后重新双击一键启动。" -ForegroundColor Yellow
-    }
-    Start-Sleep -Seconds 3
-    exit 0
-}
-
 if (Test-Path $qrPath) {
     Remove-Item -LiteralPath $qrPath -Force
 }
