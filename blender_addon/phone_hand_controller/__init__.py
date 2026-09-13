@@ -301,6 +301,9 @@ class RuntimeState:
         self.pinch_down: dict[str, bool] = {"LEFT": False, "RIGHT": False}
         self.tracked_sides: set[str] = set()
         self.last_interaction_time = 0.0
+        self.hand_positions: dict[str, list[Vector]] = {}
+        self.hand_previous_positions: dict[str, list[Vector]] = {}
+        self.last_physics_step = 0.0
         self.finger_bindings: dict[str, dict[str, dict[str, object]]] = {}
 
 STATE = RuntimeState()
@@ -339,8 +342,8 @@ class PHCSettings(PropertyGroup):
     camera_lens: FloatProperty(name="摄像机焦距 (mm)", default=DEFAULT_CAMERA_LENS, min=18.0, max=120.0)
     lock_camera_view: BoolProperty(name="锁定 3D 视图到固定摄像机", default=True)
     hide_untracked_hands: BoolProperty(name="隐藏未捕捉的手", default=True)
-    interaction_enabled: BoolProperty(name="启用手部交互", default=True)
-    pinch_threshold: FloatProperty(name="捏合阈值", default=0.060, min=0.020, max=0.150)
+    interaction_enabled: BoolProperty(name="启用手部体积碰撞", default=True)
+    pinch_threshold: FloatProperty(name="击打力度阈值", default=0.35, min=0.02, max=3.0)
     min_cutoff: FloatProperty(name="静止稳定强度", default=1.15, min=0.05, max=10.0)
     speed_boost: FloatProperty(name="移动跟随强度", default=0.055, min=0.0, max=1.0)
     prediction_ms: FloatProperty(name="预测补偿 (ms)", default=0.0, min=0.0, max=30.0)
@@ -530,9 +533,9 @@ class PHC_OT_CreateFixedScene(Operator):
         _link_box("PHC_Frame_Right", (frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
 
         interaction_specs = (
-            ("Toggle", "TOGGLE", (-1.42, -0.28, 1.05), (0.42, 0.42, 0.30), (1.0, 0.22, 0.05, 1.0)),
-            ("Bounce", "BOUNCE", (0.0, -0.28, 1.05), (0.46, 0.46, 0.24), (0.10, 0.95, 0.45, 1.0)),
-            ("Spin", "SPIN", (1.42, -0.28, 1.10), (0.46, 0.46, 0.46), (0.10, 0.48, 1.0, 1.0)),
+            ("Toggle", "TOGGLE", (-1.45, -0.28, 0.84), (0.42, 0.42, 0.28), (1.0, 0.22, 0.05, 1.0)),
+            ("Bounce", "BOUNCE", (-0.50, -0.28, 0.82), (0.46, 0.46, 0.24), (0.10, 0.95, 0.45, 1.0)),
+            ("Spin", "SPIN", (0.45, -0.28, 0.94), (0.48, 0.48, 0.48), (0.10, 0.48, 1.0, 1.0)),
         )
         for label, interaction_type, location, dimensions, color in interaction_specs:
             material = _make_material("PHC_Interactive_" + label, color, metallic=0.2, roughness=0.24)
@@ -551,13 +554,62 @@ class PHC_OT_CreateFixedScene(Operator):
                 obj = _link_box("PHC_Interactive_" + label, location, dimensions, collection, material)
             obj["phc_interactive"] = True
             obj["phc_interaction_type"] = interaction_type
-            obj["phc_interaction_radius"] = 0.38
             obj["phc_base_location"] = list(location)
             obj["phc_active"] = False
             obj["phc_bounce_start"] = -10.0
             obj["phc_last_update"] = 0.0
-            text_obj = _link_text("PHC_Label_" + label, label.upper(), (location[0], location[1] - 0.02, location[2] + 0.46), collection, material)
+            obj["phc_last_trigger"] = -10.0
+            obj["phc_velocity"] = [0.0, 0.0, 0.0]
+            obj["phc_angular_velocity"] = [0.0, 0.0, 0.0]
+            if interaction_type == "SPIN":
+                obj["phc_collision_shape"] = "SPHERE"
+                obj["phc_collision_radius"] = 0.24
+            else:
+                obj["phc_collision_shape"] = "BOX"
+                obj["phc_collision_half_extents"] = [value * 0.5 for value in dimensions]
+            text_obj = _link_text("PHC_Label_" + label, label.upper(), (location[0], location[1] - 0.02, location[2] + 0.42), collection, material)
             text_obj.rotation_euler.x = math.radians(90.0)
+
+        punch_material = _make_material("PHC_Interactive_Punch", (1.0, 0.62, 0.08, 1.0), metallic=0.1, roughness=0.28)
+        punch_shader = next(node for node in punch_material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+        punch_shader.inputs["Emission Color"].default_value = (1.0, 0.35, 0.04, 1.0)
+        punch_shader.inputs["Emission Strength"].default_value = 0.35
+        punch_base = _link_box("PHC_PunchBase", (1.55, -0.20, 0.74), (0.22, 0.22, 0.08), collection, punch_material)
+        punch_base["phc_collision_shape"] = "BOX"
+        punch_base["phc_collision_half_extents"] = [0.11, 0.11, 0.04]
+
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=0.24, location=(1.55, -0.20, 1.69))
+        punch_ball = bpy.context.active_object
+        punch_ball.name = "PHC_PunchBall"
+        _move_to_collection(punch_ball, collection)
+        punch_ball["phc_generated"] = True
+        punch_ball["phc_scene_generated"] = True
+        punch_ball["phc_interactive"] = True
+        punch_ball["phc_interaction_type"] = "PUNCH_BALL"
+        punch_ball["phc_collision_shape"] = "SPHERE"
+        punch_ball["phc_collision_radius"] = 0.24
+        punch_ball["phc_base_location"] = [1.55, -0.20, 1.69]
+        punch_ball["phc_rest_offset"] = [0.0, 0.0, 1.17]
+        punch_ball["phc_spring_stiffness"] = 45.0
+        punch_ball["phc_spring_damping"] = 7.5
+        punch_ball["phc_spring_last_time"] = 0.0
+        punch_ball["phc_active"] = False
+        punch_ball["phc_last_hit"] = -10.0
+        punch_ball["phc_last_trigger"] = -10.0
+        punch_ball["phc_velocity"] = [0.0, 0.0, 0.0]
+        punch_ball["phc_angular_velocity"] = [0.0, 0.0, 0.0]
+        punch_ball.data.materials.append(punch_material)
+
+        bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=0.045, depth=1.0, location=(1.55, -0.20, 1.215))
+        punch_rod = bpy.context.active_object
+        punch_rod.name = "PHC_PunchRod"
+        _move_to_collection(punch_rod, collection)
+        punch_rod["phc_generated"] = True
+        punch_rod["phc_scene_generated"] = True
+        punch_rod.data.materials.append(punch_material)
+        punch_label = _link_text("PHC_Label_Punch", "PUNCH", (1.55, -0.22, 2.02), collection, punch_material)
+        punch_label.rotation_euler.x = math.radians(90.0)
+
 
         camera_data = bpy.data.cameras.new(FIXED_CAMERA_NAME + "Data")
         camera_data.lens = settings.camera_lens
@@ -594,6 +646,9 @@ class PHC_OT_CreateFixedScene(Operator):
         context.scene.render.resolution_percentage = 100
         context.scene.render.image_settings.file_format = "PNG"
         context.scene.render.fps = 60
+        context.scene.frame_start = 1
+        context.scene.frame_end = 1000000
+        context.scene.frame_set(1)
         world = context.scene.world or bpy.data.worlds.new("PHC_World")
         context.scene.world = world
         world.use_nodes = True
@@ -607,7 +662,11 @@ class PHC_OT_CreateFixedScene(Operator):
         settings.position_scale = 1.0
         settings.depth_scale = 2.4
         settings.hand_scale = 3.0
+        settings.pinch_threshold = 0.35
         STATE.calibration.clear()
+        STATE.hand_positions.clear()
+        STATE.hand_previous_positions.clear()
+        STATE.last_physics_step = 0.0
         for item in STATE.filters.values():
             item.reset()
         _set_viewport_camera(settings)
@@ -859,66 +918,235 @@ def _set_demo_hand_visible(side: str, visible: bool) -> None:
             pass
 
 
-def _pinch_is_down(hand: HandPacket, threshold: float) -> bool:
-    thumb_tip = landmark(hand.image, 4)
-    index_tip = landmark(hand.image, 8)
-    return (thumb_tip - index_tip).length <= threshold
+def _hand_volume_samples(side: str):
+    current = STATE.hand_positions.get(side)
+    previous = STATE.hand_previous_positions.get(side)
+    if not current:
+        return []
+    if not previous or len(previous) != len(current):
+        previous = current
+    samples = []
+    for index, point in enumerate(current):
+        samples.append((point, previous[index], 0.045))
+    for start, end in HAND_CONNECTIONS:
+        point = (current[start] + current[end]) * 0.5
+        old_point = (previous[start] + previous[end]) * 0.5
+        samples.append((point, old_point, 0.030))
+    point = sum((current[index] for index in PALM_INDEXES), Vector()) / len(PALM_INDEXES)
+    old_point = sum((previous[index] for index in PALM_INDEXES), Vector()) / len(PALM_INDEXES)
+    samples.append((point, old_point, 0.120))
+    return samples
 
 
-def _trigger_interaction(obj, now: float) -> None:
+def _object_volume_collision(obj, sample: Vector, hand_radius: float):
+    shape = str(obj.get("phc_collision_shape", "SPHERE"))
+    if shape == "SPHERE":
+        center = obj.location.copy()
+        radius = float(obj.get("phc_collision_radius", 0.25))
+        delta = sample - center
+        distance = delta.length
+        limit = radius + hand_radius
+        if distance >= limit:
+            return None
+        normal = (center - sample).normalized() if distance > 1.0e-6 else Vector((0.0, 0.0, 1.0))
+        return normal, limit - distance, center
+    half = Vector(obj.get("phc_collision_half_extents", (0.2, 0.2, 0.2)))
+    inverse = obj.matrix_world.inverted()
+    local = inverse @ sample
+    closest_local = Vector((
+        max(-half.x, min(half.x, local.x)),
+        max(-half.y, min(half.y, local.y)),
+        max(-half.z, min(half.z, local.z)),
+    ))
+    closest_world = obj.matrix_world @ closest_local
+    delta = sample - closest_world
+    distance = delta.length
+    if distance >= hand_radius:
+        return None
+    normal = (closest_world - sample).normalized() if distance > 1.0e-6 else (obj.location - sample).normalized()
+    return normal, hand_radius - distance, closest_world
+
+
+def _apply_collision_impulse(obj, normal: Vector, impact: float, penetration: float, contact: Vector) -> float:
+    impulse_speed = min(6.0, max(0.0, impact * 0.8 + penetration * 22.0))
+    if impulse_speed <= 0.0:
+        return 0.0
+    velocity = Vector(obj.get("phc_velocity", (0.0, 0.0, 0.0)))
+    velocity += normal * impulse_speed
+    obj["phc_velocity"] = list(velocity)
+    angular = Vector(obj.get("phc_angular_velocity", (0.0, 0.0, 0.0)))
+    lever = contact - obj.location
+    angular += lever.cross(normal * impulse_speed) * 1.6
+    obj["phc_angular_velocity"] = list(angular)
+    return impulse_speed
+
+
+def _trigger_interaction(obj, impact: float, now: float) -> None:
     interaction = str(obj.get("phc_interaction_type", ""))
-    if interaction == "TOGGLE":
+    if interaction in {"TOGGLE", "SPIN"}:
         obj["phc_active"] = not bool(obj.get("phc_active", False))
     elif interaction == "BOUNCE":
+        obj["phc_active"] = True
         obj["phc_bounce_start"] = now
-    elif interaction == "SPIN":
-        obj["phc_active"] = not bool(obj.get("phc_active", False))
+        rigid_body = getattr(obj, "rigid_body", None)
+        if rigid_body is not None:
+            velocity = Vector(rigid_body.linear_velocity)
+            velocity.z += min(2.0, 0.8 + impact * 0.4)
+            rigid_body.linear_velocity = velocity
+    elif interaction == "PUNCH_BALL":
+        obj["phc_last_hit"] = now
+        obj["phc_active"] = True
+
+
+def _apply_punch_spring(now: float) -> None:
+    ball = bpy.data.objects.get("PHC_PunchBall")
+    base = bpy.data.objects.get("PHC_PunchBase")
+    if ball is None or base is None:
+        return
+    rest_offset = Vector(ball.get("phc_rest_offset", (0.0, 0.0, 1.17)))
+    target = base.location + rest_offset
+    velocity = Vector(ball.get("phc_velocity", (0.0, 0.0, 0.0)))
+    offset = target - ball.location
+    stiffness = float(ball.get("phc_spring_stiffness", 45.0))
+    damping = float(ball.get("phc_spring_damping", 7.5))
+    dt = min(0.05, max(1.0 / 240.0, now - float(ball.get("phc_spring_last_time", now))))
+    ball["phc_spring_last_time"] = now
+    velocity += (offset * stiffness - velocity * damping) * dt
+    if velocity.length > 12.0:
+        velocity.normalize()
+        velocity *= 12.0
+    ball["phc_velocity"] = list(velocity)
+
+
+def _update_punch_rod() -> None:
+    ball = bpy.data.objects.get("PHC_PunchBall")
+    base = bpy.data.objects.get("PHC_PunchBase")
+    rod = bpy.data.objects.get("PHC_PunchRod")
+    if ball is None or base is None or rod is None:
+        return
+    vector = ball.location - base.location
+    length = max(0.01, vector.length)
+    rod.location = (base.location + ball.location) * 0.5
+    rod.rotation_mode = "QUATERNION"
+    rod.rotation_quaternion = vector.to_track_quat("Z", "Y")
+    rod.scale = (1.0, 1.0, length)
+
+
+def _collision_radius(obj) -> float:
+    if str(obj.get("phc_collision_shape", "SPHERE")) == "SPHERE":
+        return float(obj.get("phc_collision_radius", 0.25))
+    half = Vector(obj.get("phc_collision_half_extents", (0.2, 0.2, 0.2)))
+    return max(0.05, half.length * 0.72)
+
+
+def _support_height(obj) -> float:
+    half = Vector(obj.get("phc_collision_half_extents", (0.2, 0.2, 0.2)))
+    radius = float(obj.get("phc_collision_radius", 0.0))
+    half_height = radius if str(obj.get("phc_collision_shape", "SPHERE")) == "SPHERE" else half.z
+    on_table = -2.5 <= obj.location.x <= 2.5 and -1.25 <= obj.location.y <= 1.15
+    return (0.70 if on_table else 0.0) + half_height
+
+
+def _step_custom_physics(scene, now: float) -> None:
+    dt = min(0.05, max(1.0 / 240.0, now - STATE.last_physics_step))
+    if now - STATE.last_physics_step < 1.0 / 90.0:
+        return
+    STATE.last_physics_step = now
+    objects = [item for item in bpy.data.objects if item.get("phc_interactive") and item.get("phc_interaction_type") != "PUNCH_BALL"]
+    for obj in objects:
+        velocity = Vector(obj.get("phc_velocity", (0.0, 0.0, 0.0)))
+        velocity.z -= 9.81 * dt
+        obj.location += velocity * dt
+        floor_height = _support_height(obj)
+        if obj.location.z < floor_height:
+            obj.location.z = floor_height
+            if velocity.z < 0.0:
+                velocity.z = -velocity.z * 0.35
+            velocity.x *= 0.94
+            velocity.y *= 0.94
+        frame_width, _frame_height = camera_frame_dimensions(bpy.context.scene.phone_hand_control)
+        limit_x = max(0.2, frame_width * 0.5 - _collision_radius(obj))
+        obj.location.x = max(-limit_x, min(limit_x, obj.location.x))
+        obj.location.y = max(-0.45, min(1.35, obj.location.y))
+        angular = Vector(obj.get("phc_angular_velocity", (0.0, 0.0, 0.0)))
+        angular *= max(0.0, 1.0 - 0.8 * dt)
+        obj.rotation_euler = Vector(obj.rotation_euler) + angular * dt
+        obj["phc_velocity"] = list(velocity)
+        obj["phc_angular_velocity"] = list(angular)
+
+    _apply_punch_spring(now)
+    ball = bpy.data.objects.get("PHC_PunchBall")
+    if ball is not None:
+        velocity = Vector(ball.get("phc_velocity", (0.0, 0.0, 0.0)))
+        velocity.z -= 9.81 * dt
+        ball.location += velocity * dt
+        base = bpy.data.objects.get("PHC_PunchBase")
+        if base is not None and ball.location.z < base.location.z + 0.30:
+            ball.location.z = base.location.z + 0.30
+            velocity.z = max(0.0, -velocity.z * 0.35)
+        ball["phc_velocity"] = list(velocity)
+
+    dynamics = [item for item in bpy.data.objects if item.get("phc_interactive")]
+    for index, first in enumerate(dynamics):
+        for second in dynamics[index + 1:]:
+            delta = second.location - first.location
+            distance = delta.length
+            overlap = _collision_radius(first) + _collision_radius(second) - distance
+            if distance <= 1.0e-6 or overlap <= 0.0:
+                continue
+            normal = delta / distance
+            first.location -= normal * overlap * 0.5
+            second.location += normal * overlap * 0.5
+            first_velocity = Vector(first.get("phc_velocity", (0.0, 0.0, 0.0)))
+            second_velocity = Vector(second.get("phc_velocity", (0.0, 0.0, 0.0)))
+            relative = (first_velocity - second_velocity).dot(normal)
+            if relative > 0.0:
+                impulse = normal * relative * 0.55
+                first_velocity -= impulse
+                second_velocity += impulse
+                first["phc_velocity"] = list(first_velocity)
+                second["phc_velocity"] = list(second_velocity)
+
+    _update_punch_rod()
 
 
 def _update_interactions(hands, settings, now: float) -> None:
-    if not settings.interaction_enabled:
-        return
-    index_tips = []
-    for side, hand in hands:
-        joint = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_08")
-        if joint is not None:
-            index_tips.append(joint.location.copy())
-    for obj in [item for item in bpy.data.objects if item.get("phc_interactive")]:
-        base_values = obj.get("phc_base_location", [obj.location.x, obj.location.y, obj.location.z])
-        base = Vector(base_values)
-        last_update = float(obj.get("phc_last_update", now))
-        elapsed = max(0.0, min(0.1, now - last_update))
-        obj["phc_last_update"] = now
-        radius = float(obj.get("phc_interaction_radius", 0.32))
-        hovered = False
-        for point in index_tips:
-            if (point - obj.location).length <= radius:
-                hovered = True
-                break
-        interaction = str(obj.get("phc_interaction_type", ""))
+    scene = bpy.context.scene
+    for obj in (item for item in bpy.data.objects if item.get("phc_interactive")):
+        best_hit = None
+        if settings.interaction_enabled:
+            for side, _hand in hands:
+                for point, old_point, radius in _hand_volume_samples(side):
+                    collision = _object_volume_collision(obj, point, radius)
+                    if collision is None:
+                        continue
+                    normal, penetration, contact = collision
+                    hand_velocity = (point - old_point) / 0.0166667
+                    impact = max(0.0, hand_velocity.dot(normal))
+                    if impact <= 0.0 and penetration <= 0.0:
+                        continue
+                    score = impact + penetration * 10.0
+                    if best_hit is None or score > best_hit[0]:
+                        best_hit = (score, normal, impact, penetration, contact)
+        if best_hit is not None:
+            score, normal, impact, penetration, contact = best_hit
+            applied = _apply_collision_impulse(obj, normal, impact, penetration, contact)
+            if applied >= float(settings.pinch_threshold):
+                if now - float(obj.get("phc_last_trigger", -10.0)) > 0.18:
+                    _trigger_interaction(obj, applied, now)
+                    obj["phc_last_trigger"] = now
         active = bool(obj.get("phc_active", False))
-        if interaction == "BOUNCE":
-            start = float(obj.get("phc_bounce_start", -10.0))
-            progress = (now - start) / 0.65
-            if 0.0 <= progress <= 1.0:
-                obj.location = base + Vector((0.0, 0.0, 0.38 * math.sin(math.pi * progress)))
-            else:
-                obj.location = base
-        elif interaction == "TOGGLE":
-            obj.location = base + Vector((0.0, 0.0, 0.16 if active else 0.0))
-        elif interaction == "SPIN":
-            if active:
-                obj.rotation_euler.z += elapsed * 2.8
-            obj.location = base + Vector((0.0, 0.0, 0.10 if hovered else 0.0))
         if obj.data is not None and obj.data.materials:
             material = obj.data.materials[0]
             shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None) if material.use_nodes else None
             if shader is not None:
-                shader.inputs["Emission Strength"].default_value = 7.0 if hovered else (2.5 if active else 0.35)
+                shader.inputs["Emission Strength"].default_value = 7.0 if best_hit is not None else (2.5 if active else 0.35)
+    _step_custom_physics(scene, now)
 
 
 def _update_demo_hand(side: str, hand: HandPacket, timestamp: float, settings) -> None:
     _set_demo_hand_visible(side, True)
+    previous_positions = STATE.hand_positions.get(side)
     tag = 'L' if side == 'LEFT' else 'R'
     calibration = STATE.calibration.get(side, {})
     stage_anchor = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
@@ -943,6 +1171,8 @@ def _update_demo_hand(side: str, hand: HandPacket, timestamp: float, settings) -
         if joint is not None:
             joint.location = position
             joint.update_tag(refresh={"OBJECT"})
+    STATE.hand_previous_positions[side] = [item.copy() for item in (previous_positions or positions)]
+    STATE.hand_positions[side] = [item.copy() for item in positions]
     for (start, end) in HAND_CONNECTIONS:
         bone = bpy.data.objects.get(f"PHC_{tag}_Bone_{start:02d}_{end:02d}")
         if bone is None:
@@ -1049,6 +1279,7 @@ def controller_timer():
     packet = receiver.take_latest()
     now = time.monotonic()
     now_ns = time.monotonic_ns()
+    tracked_hands = []
     if packet is not None:
         STATE.last_packet_ns = packet.receive_ns
         STATE.last_sequence = packet.sequence
@@ -1057,7 +1288,6 @@ def controller_timer():
             span = STATE.receive_times[-1] - STATE.receive_times[0]
             if span > 0.0:
                 STATE.measured_hz = (len(STATE.receive_times) - 1) / span
-        tracked_hands = []
         for side in ("LEFT", "RIGHT"):
             hand = _select_hand(packet, side, settings.swap_hands)
             if hand is None:
@@ -1075,17 +1305,6 @@ def controller_timer():
             elif settings.control_mode == "ARMATURE":
                 _update_armature_hand(side, hand, settings)
         STATE.tracked_sides = {side for side, _hand in tracked_hands}
-        if settings.control_mode == "DEMO" and settings.interaction_enabled:
-            for side, hand in tracked_hands:
-                pinch = _pinch_is_down(hand, settings.pinch_threshold)
-                if pinch and not STATE.pinch_down[side]:
-                    tip = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_08")
-                    if tip is not None:
-                        for obj in (item for item in bpy.data.objects if item.get("phc_interactive")):
-                            if (tip.location - obj.location).length <= float(obj.get("phc_interaction_radius", 0.32)):
-                                _trigger_interaction(obj, now)
-                STATE.pinch_down[side] = pinch
-            _update_interactions(tracked_hands, settings, now)
         STATE.last_status = f"已接收 {len(packet.hands)} 只手"
     elif STATE.last_packet_ns and (now_ns - STATE.last_packet_ns) / 1_000_000 > settings.timeout_ms:
         STATE.last_status = "等待手机数据超过超时时间"
@@ -1095,6 +1314,9 @@ def controller_timer():
         STATE.tracked_sides.clear()
         STATE.pinch_down["LEFT"] = False
         STATE.pinch_down["RIGHT"] = False
+
+    if settings.control_mode == "DEMO":
+        _update_interactions(tracked_hands, settings, now)
 
     if now - STATE.last_ui_update >= 0.25:
         age_ms = (now_ns - STATE.last_packet_ns) / 1_000_000 if STATE.last_packet_ns else None
@@ -1117,9 +1339,18 @@ class PHC_OT_ResetInteractions(Operator):
     def execute(self, context):
         for obj in (item for item in bpy.data.objects if item.get("phc_interactive")):
             base = obj.get("phc_base_location", [obj.location.x, obj.location.y, obj.location.z])
-            obj.location = Vector(base)
+            if obj.get("phc_interaction_type") == "PUNCH_BALL":
+                punch_base = bpy.data.objects.get("PHC_PunchBase")
+                rest = Vector(obj.get("phc_rest_offset", (0.0, 0.0, 0.95)))
+                if punch_base is not None:
+                    obj.location = punch_base.location + rest
+            else:
+                obj.location = Vector(base)
             obj["phc_active"] = False
             obj["phc_bounce_start"] = -10.0
+            obj["phc_velocity"] = [0.0, 0.0, 0.0]
+            obj["phc_angular_velocity"] = [0.0, 0.0, 0.0]
+        _update_punch_rod()
         self.report({"INFO"}, "交互物体已重置")
         return {"FINISHED"}
 
