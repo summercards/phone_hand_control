@@ -84,6 +84,12 @@ release_hand = module.HandPacket(2, 1, 1.0, tuple(release_image), world)
 module._update_grab(settings, [("RIGHT", release_hand)], time.monotonic() + 0.2)
 grab_released = not bool(toggle.get("phc_held"))
 
+toggle.location.x = 10.0
+module.STATE.last_physics_step = 0.0
+module._step_custom_physics(bpy.context.scene, time.monotonic() + 1.0)
+wall_contained = toggle.location.x <= module.ENCLOSURE_X_LIMIT and toggle.get("phc_velocity", [0.0])[0] <= 0.0
+walls_exist = all(bpy.data.objects.get(name) is not None for name in ("PHC_Scene_Wall_Left", "PHC_Scene_Wall_Right", "PHC_Scene_Backdrop"))
+
 checks = {
     "left_hidden": left_joint.hide_get() and left_joint.hide_render,
     "right_visible": not right_joint.hide_get() and not right_joint.hide_render,
@@ -95,6 +101,8 @@ checks = {
     "grab_acquired": grab_acquired,
     "grab_followed": grab_followed,
     "grab_released": grab_released,
+    "wall_contained": wall_contained,
+    "walls_exist": walls_exist,
 }
 if not all(checks.values()):
     raise RuntimeError(json.dumps({"checks": checks, "punch_error": punch_error, "grab_name": module.STATE.grabbed_object_name, "grabable": bool(toggle.get("phc_grabable")), "pinch": module._pinch_distance(pinch_hand), "point": list((grab_points[4] + grab_points[8]) * 0.5), "object": list(toggle.location), "pickup_enabled": settings.pickup_enabled, "pickup_threshold": settings.pickup_threshold, "pickup_radius": settings.pickup_radius, "previous_pinch": module.STATE.previous_pinch}, ensure_ascii=False))

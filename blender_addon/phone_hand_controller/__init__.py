@@ -52,6 +52,10 @@ DEFAULT_CAMERA_SENSOR = 36.0
 DEFAULT_STAGE_Z = 1.45
 DEFAULT_FRAME_WIDTH = 4.68
 DEFAULT_FRAME_HEIGHT = 2.63
+ENCLOSURE_X_LIMIT = 2.15
+ENCLOSURE_Y_MIN = -0.80
+ENCLOSURE_Y_MAX = 1.35
+ENCLOSURE_Z_MAX = 3.0
 PHONE_REFERENCE_DISTANCE = 0.65
 NEUTRAL_HAND_2D = (
     (0.50, 0.78), (0.42, 0.68), (0.36, 0.60), (0.31, 0.53), (0.27, 0.47),
@@ -596,6 +600,8 @@ class PHC_OT_CreateFixedScene(Operator):
 
         _link_box("PHC_Scene_Floor", (0.0, 0.0, -0.06), (12.0, 12.0, 0.12), collection, floor_material)
         _link_box("PHC_Scene_Backdrop", (0.0, 1.55, 2.45), (8.0, 0.12, 5.0), collection, wall_material)
+        _link_box("PHC_Scene_Wall_Left", (-2.22, 0.38, 2.0), (0.18, 3.6, 4.0), collection, wall_material)
+        _link_box("PHC_Scene_Wall_Right", (2.22, 0.38, 2.0), (0.18, 3.6, 4.0), collection, wall_material)
         _link_box("PHC_Scene_Platform", (0.0, -0.05, 0.30), (3.8, 1.9, 0.60), collection, platform_material)
 
         stage_y = settings.stage_origin_y
@@ -1176,10 +1182,16 @@ def _step_custom_physics(scene, now: float) -> None:
                 velocity.z = -velocity.z * 0.35
             velocity.x *= 0.94
             velocity.y *= 0.94
-        frame_width, _frame_height = camera_frame_dimensions(bpy.context.scene.phone_hand_control)
-        limit_x = max(0.2, frame_width * 0.5 - _collision_radius(obj))
-        obj.location.x = max(-limit_x, min(limit_x, obj.location.x))
-        obj.location.y = max(-0.45, min(1.35, obj.location.y))
+        limit_x = max(0.2, ENCLOSURE_X_LIMIT - _collision_radius(obj))
+        if obj.location.x < -limit_x or obj.location.x > limit_x:
+            obj.location.x = max(-limit_x, min(limit_x, obj.location.x))
+            velocity.x *= -0.45
+        if obj.location.y < ENCLOSURE_Y_MIN or obj.location.y > ENCLOSURE_Y_MAX:
+            obj.location.y = max(ENCLOSURE_Y_MIN, min(ENCLOSURE_Y_MAX, obj.location.y))
+            velocity.y *= -0.45
+        if obj.location.z > ENCLOSURE_Z_MAX:
+            obj.location.z = ENCLOSURE_Z_MAX
+            velocity.z *= -0.45
         angular = Vector(obj.get("phc_angular_velocity", (0.0, 0.0, 0.0)))
         angular *= max(0.0, 1.0 - 0.8 * dt)
         obj.rotation_euler = Vector(obj.rotation_euler) + angular * dt
