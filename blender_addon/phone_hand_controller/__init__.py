@@ -52,6 +52,7 @@ DEFAULT_CAMERA_SENSOR = 36.0
 DEFAULT_STAGE_Z = 1.45
 DEFAULT_FRAME_WIDTH = 4.68
 DEFAULT_FRAME_HEIGHT = 2.63
+PHONE_REFERENCE_DISTANCE = 0.65
 NEUTRAL_HAND_2D = (
     (0.50, 0.78), (0.42, 0.68), (0.36, 0.60), (0.31, 0.53), (0.27, 0.47),
     (0.48, 0.59), (0.48, 0.48), (0.48, 0.38), (0.48, 0.29),
@@ -267,22 +268,48 @@ def palm_center(image: tuple[float, ...]) -> Vector:
     return value / len(PALM_INDEXES)
 
 
-def camera_frame_dimensions(settings) -> tuple[float, float]:
+def camera_frame_dimensions_at_distance(settings, distance: float) -> tuple[float, float]:
     camera = bpy.data.objects.get(FIXED_CAMERA_NAME)
     if camera is None or camera.type != "CAMERA":
-        return DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT
+        ratio = max(0.1, distance / DEFAULT_CAMERA_DISTANCE)
+        return DEFAULT_FRAME_WIDTH * ratio, DEFAULT_FRAME_HEIGHT * ratio
     camera_data = camera.data
     lens = max(1.0, float(settings.camera_lens or camera_data.lens))
     sensor = max(1.0, float(camera_data.sensor_width))
-    forward = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
-    stage_center = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
-    distance = max(0.5, (stage_center - camera.matrix_world.translation).dot(forward))
     width = distance * sensor / lens
     camera_data.lens = lens
     resolution_x = max(1, bpy.context.scene.render.resolution_x)
     resolution_y = max(1, bpy.context.scene.render.resolution_y)
     height = width * resolution_y / resolution_x
     return width, height
+
+
+def camera_frame_dimensions(settings) -> tuple[float, float]:
+    camera = bpy.data.objects.get(FIXED_CAMERA_NAME)
+    if camera is None or camera.type != "CAMERA":
+        return DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT
+    forward = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+    stage_center = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
+    distance = max(0.5, (stage_center - camera.matrix_world.translation).dot(forward))
+    return camera_frame_dimensions_at_distance(settings, distance)
+
+
+def palm_scale(image: tuple[float, ...], world: tuple[float, ...]) -> float:
+    projected = palm_spread(image)
+    world_width = (landmark(world, 5) - landmark(world, 17)).length
+    world_length = (landmark(world, 9) - landmark(world, 0)).length
+    physical = max(0.01, world_width * 0.7 + world_length * 0.3)
+    return projected / physical
+
+
+def palm_spread(image: tuple[float, ...]) -> float:
+    index_mcp = landmark(image, 5)
+    pinky_mcp = landmark(image, 17)
+    wrist = landmark(image, 0)
+    middle_mcp = landmark(image, 9)
+    width = Vector((index_mcp.x - pinky_mcp.x, index_mcp.y - pinky_mcp.y)).length
+    length = Vector((middle_mcp.x - wrist.x, middle_mcp.y - wrist.y)).length
+    return max(0.02, width * 0.7 + length * 0.3)
 
 class RuntimeState:
     def __init__(self) -> None:
@@ -335,7 +362,7 @@ class PHCSettings(PropertyGroup):
     mirror_x: BoolProperty(name="镜像 X（自然自拍方向）", default=True)
     swap_hands: BoolProperty(name="交换左右手", default=False)
     position_scale: FloatProperty(name="画面位置倍率", default=1.0, min=0.1, max=3.0)
-    depth_scale: FloatProperty(name="深度位移", default=2.4, min=0.0, max=20.0)
+    depth_scale: FloatProperty(name="前后空间倍率", default=3.0, min=0.0, max=10.0)
     hand_scale: FloatProperty(name="深度/手部尺寸", default=3.0, min=0.1, max=10.0)
     stage_origin_y: FloatProperty(name="固定场景 Y", default=0.0, min=-10.0, max=10.0)
     stage_origin_z: FloatProperty(name="固定场景 Z", default=DEFAULT_STAGE_Z, min=-10.0, max=10.0)
@@ -660,7 +687,7 @@ class PHC_OT_CreateFixedScene(Operator):
         settings.stage_origin_y = stage_y
         settings.stage_origin_z = stage_z
         settings.position_scale = 1.0
-        settings.depth_scale = 2.4
+        settings.depth_scale = 3.0
         settings.hand_scale = 3.0
         settings.pinch_threshold = 0.35
         STATE.calibration.clear()
@@ -810,6 +837,7 @@ class PHC_OT_Calibrate(Operator):
                 target_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
             STATE.calibration[side] = {
                 "origin": (Vector((0.5, 0.5, 0.0)) if settings.control_mode == "DEMO" else palm_center(hand.image)),
+                "palm_spread": palm_scale(hand.image, hand.world),
                 "target_location": target_location,
                 "sensor_rotation": _palm_quaternion(hand, settings.mirror_x),
                 "target_rotation": target_rotation,
@@ -825,15 +853,28 @@ class PHC_OT_Calibrate(Operator):
         return {"FINISHED"}
 
 
-def _origin_delta(hand: HandPacket, settings, calibration) -> Vector:
+def _origin_delta(side: str, hand: HandPacket, settings, calibration) -> Vector:
     current = palm_center(hand.image)
     reference = calibration.get("origin") if calibration else Vector((0.5, 0.5, 0.0))
+    if not calibration:
+        calibration = STATE.calibration.setdefault(side, {})
+    else:
+        STATE.calibration[side] = calibration
+    spread = palm_scale(hand.image, hand.world)
+    reference_spread = float(calibration.setdefault("palm_spread", spread))
+    ratio = max(0.35, min(2.8, spread / reference_spread))
+    phone_depth_offset = PHONE_REFERENCE_DISTANCE * (ratio - 1.0) * settings.depth_scale
+    phone_depth_offset = max(-2.5, min(2.5, phone_depth_offset))
+    camera = bpy.data.objects.get(FIXED_CAMERA_NAME)
+    camera_y = camera.location.y if camera is not None else -DEFAULT_CAMERA_DISTANCE
+    base_distance = max(0.5, settings.stage_origin_y - camera_y)
+    current_distance = max(0.5, base_distance - phone_depth_offset)
+    frame_width, frame_height = camera_frame_dimensions_at_distance(settings, current_distance)
     delta = current - reference
     sign = -1.0 if settings.mirror_x else 1.0
-    frame_width, frame_height = camera_frame_dimensions(settings)
     return Vector((
         sign * delta.x * frame_width * settings.position_scale,
-        -delta.z * settings.depth_scale,
+        -phone_depth_offset,
         -delta.y * frame_height * settings.position_scale,
     ))
 
@@ -1151,10 +1192,16 @@ def _update_demo_hand(side: str, hand: HandPacket, timestamp: float, settings) -
     calibration = STATE.calibration.get(side, {})
     stage_anchor = Vector((0.0, settings.stage_origin_y, settings.stage_origin_z))
     anchor = calibration.get("target_location", stage_anchor)
-    base = anchor + _origin_delta(hand, settings, calibration)
+    base = anchor + _origin_delta(side, hand, settings, calibration)
     image_reference = palm_center(hand.image)
     world_reference = landmark(hand.world, 0)
-    frame_width, frame_height = camera_frame_dimensions(settings)
+    camera = bpy.data.objects.get(FIXED_CAMERA_NAME)
+    if camera is not None:
+        forward = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+        plane_distance = max(0.5, (base - camera.matrix_world.translation).dot(forward))
+    else:
+        plane_distance = DEFAULT_CAMERA_DISTANCE
+    frame_width, frame_height = camera_frame_dimensions_at_distance(settings, plane_distance)
     sign = -1.0 if settings.mirror_x else 1.0
     positions: list[Vector] = []
     for index in range(21):
@@ -1222,7 +1269,7 @@ def _update_object_hand(side: str, hand: HandPacket, settings) -> None:
             ),
         }
         STATE.calibration[side] = calibration
-    target.location = calibration["target_location"] + _origin_delta(hand, settings, calibration)
+    target.location = calibration["target_location"] + _origin_delta(side, hand, settings, calibration)
     _set_target_rotation(target, sensor_rotation, calibration)
     target.update_tag(refresh={"OBJECT"})
     if settings.auto_keyframe:
@@ -1252,7 +1299,7 @@ def _update_armature_hand(side: str, hand: HandPacket, settings) -> None:
             "target_rotation": pose_bone.rotation_quaternion.copy(),
         }
         STATE.calibration[side] = calibration
-    delta_world = _origin_delta(hand, settings, calibration)
+    delta_world = _origin_delta(side, hand, settings, calibration)
     local_delta = pose_bone.bone.matrix_local.to_3x3().inverted() @ delta_world
     pose_bone.location = calibration["target_location"] + local_delta
     _set_target_rotation(pose_bone, sensor_rotation, calibration)

@@ -97,4 +97,5 @@
 - 交互物体使用球体或盒体碰撞体积，接触深度和手部速度共同产生冲量。
 - `TOGGLE`、`BOUNCE`、`SPIN` 均通过实际碰撞触发。
 - 摇杆弹球底座固定，球体通过弹性杆约束摆动，测试后回正误差约 0.002 m。
-- Blender 后台验证脚本：`tests/blender_interactions_test.py`。
+- Blender 后台验证脚本：`tests/blender_interactions_test.py`、`tests/blender_depth_test.py`。
+- 前后空间测试：手掌图像放大时模型向相机移动，缩小时模型向场景深处移动。
