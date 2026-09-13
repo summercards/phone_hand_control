@@ -332,6 +332,14 @@ class RuntimeState:
         self.hand_previous_positions: dict[str, list[Vector]] = {}
         self.last_physics_step = 0.0
         self.last_exception = ""
+        self.grabbed_object_name = ""
+        self.grab_side = ""
+        self.grab_offset = Vector((0.0, 0.0, 0.0))
+        self.grab_rotation_offset = Quaternion((1.0, 0.0, 0.0, 0.0))
+        self.grab_last_point: Vector | None = None
+        self.grab_velocity = Vector((0.0, 0.0, 0.0))
+        self.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
+        self.previous_pinch: dict[str, bool] = {"LEFT": False, "RIGHT": False}
 
         self.finger_bindings: dict[str, dict[str, dict[str, object]]] = {}
 
@@ -373,6 +381,9 @@ class PHCSettings(PropertyGroup):
     hide_untracked_hands: BoolProperty(name="隐藏未捕捉的手", default=True)
     interaction_enabled: BoolProperty(name="启用手部体积碰撞", default=True)
     pinch_threshold: FloatProperty(name="击打力度阈值", default=0.35, min=0.02, max=3.0)
+    pickup_enabled: BoolProperty(name="启用捏合拿取", default=True)
+    pickup_threshold: FloatProperty(name="拿取捏合阈值", default=0.065, min=0.02, max=0.16)
+    pickup_radius: FloatProperty(name="拿取距离", default=0.28, min=0.05, max=1.0)
     min_cutoff: FloatProperty(name="静止稳定强度", default=1.15, min=0.05, max=10.0)
     speed_boost: FloatProperty(name="移动跟随强度", default=0.055, min=0.0, max=1.0)
     prediction_ms: FloatProperty(name="预测补偿 (ms)", default=0.0, min=0.0, max=30.0)
@@ -454,6 +465,30 @@ def _make_material(name: str, color: tuple[float, float, float, float], metallic
         principled.inputs["Base Color"].default_value = color
         principled.inputs["Metallic"].default_value = metallic
         principled.inputs["Roughness"].default_value = roughness
+    return material
+
+
+def _make_checker_material(name: str, color_a, color_b, scale, roughness=0.62):
+    material = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    shader = nodes.new("ShaderNodeBsdfPrincipled")
+    shader.inputs["Roughness"].default_value = roughness
+    texcoord = nodes.new("ShaderNodeTexCoord")
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.inputs["Scale"].default_value = scale
+    checker = nodes.new("ShaderNodeTexChecker")
+    checker.inputs["Color1"].default_value = color_a
+    checker.inputs["Color2"].default_value = color_b
+    checker.inputs["Scale"].default_value = 1.0
+    links.new(texcoord.outputs["Generated"], mapping.inputs["Vector"])
+    links.new(mapping.outputs["Vector"], checker.inputs["Vector"])
+    links.new(checker.outputs["Color"], shader.inputs["Base Color"])
+    links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+    material.diffuse_color = color_a
     return material
 
 
@@ -539,17 +574,29 @@ class PHC_OT_CreateFixedScene(Operator):
 
         collection = bpy.data.collections.new(FIXED_SCENE_COLLECTION)
         context.scene.collection.children.link(collection)
-        floor_material = _make_material("PHC_Scene_Floor", (0.035, 0.045, 0.065, 1.0), metallic=0.25, roughness=0.28)
-        table_material = _make_material("PHC_Scene_Table", (0.12, 0.16, 0.22, 1.0), metallic=0.45, roughness=0.22)
-        backdrop_material = _make_material("PHC_Scene_Backdrop", (0.025, 0.035, 0.05, 1.0), metallic=0.1, roughness=0.7)
-        frame_material = _make_material("PHC_Frame_Guide", (0.05, 0.55, 1.0, 1.0), metallic=0.0, roughness=0.2)
+        frame_material = _make_material("PHC_Frame_Guide", (0.08, 0.42, 0.90, 1.0), metallic=0.0, roughness=0.25)
         frame_shader = next(node for node in frame_material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
-        frame_shader.inputs["Emission Color"].default_value = (0.02, 0.35, 1.0, 1.0)
-        frame_shader.inputs["Emission Strength"].default_value = 4.0
+        frame_shader.inputs["Emission Color"].default_value = (0.05, 0.30, 0.90, 1.0)
+        frame_shader.inputs["Emission Strength"].default_value = 2.5
+        floor_material = _make_checker_material(
+            "PHC_Checker_Floor",
+            (0.78, 0.80, 0.82, 1.0),
+            (0.92, 0.93, 0.94, 1.0),
+            (10.0, 10.0, 1.0),
+            roughness=0.68,
+        )
+        wall_material = _make_checker_material(
+            "PHC_Checker_Wall",
+            (0.84, 0.86, 0.89, 1.0),
+            (0.94, 0.95, 0.97, 1.0),
+            (8.0, 1.0, 5.0),
+            roughness=0.76,
+        )
+        platform_material = _make_material("PHC_Simple_Platform", (0.70, 0.74, 0.79, 1.0), metallic=0.05, roughness=0.42)
 
         _link_box("PHC_Scene_Floor", (0.0, 0.0, -0.06), (12.0, 12.0, 0.12), collection, floor_material)
-        _link_box("PHC_Scene_Backdrop", (0.0, 1.55, 2.45), (8.0, 0.12, 5.0), collection, backdrop_material)
-        _link_box("PHC_Scene_Table", (0.0, -0.05, 0.60), (5.0, 2.4, 0.20), collection, table_material)
+        _link_box("PHC_Scene_Backdrop", (0.0, 1.55, 2.45), (8.0, 0.12, 5.0), collection, wall_material)
+        _link_box("PHC_Scene_Platform", (0.0, -0.05, 0.30), (3.8, 1.9, 0.60), collection, platform_material)
 
         stage_y = settings.stage_origin_y
         stage_z = settings.stage_origin_z
@@ -562,52 +609,37 @@ class PHC_OT_CreateFixedScene(Operator):
         _link_box("PHC_Frame_Right", (frame_width * 0.5, guide_y, stage_z), (bar, bar, frame_height), collection, frame_material)
 
         interaction_specs = (
-            ("Toggle", "TOGGLE", (-1.45, -0.28, 0.84), (0.42, 0.42, 0.28), (1.0, 0.22, 0.05, 1.0)),
-            ("Bounce", "BOUNCE", (-0.50, -0.28, 0.82), (0.46, 0.46, 0.24), (0.10, 0.95, 0.45, 1.0)),
-            ("Spin", "SPIN", (0.45, -0.28, 0.94), (0.48, 0.48, 0.48), (0.10, 0.48, 1.0, 1.0)),
+            ("Toggle", "TOGGLE", (-1.28, -0.18, 0.82), (0.42, 0.42, 0.44), (1.0, 0.30, 0.08, 1.0)),
+            ("Bounce", "BOUNCE", (1.28, -0.18, 0.82), (0.46, 0.46, 0.44), (0.12, 0.82, 0.42, 1.0)),
         )
         for label, interaction_type, location, dimensions, color in interaction_specs:
-            material = _make_material("PHC_Interactive_" + label, color, metallic=0.2, roughness=0.24)
+            material = _make_material("PHC_Interactive_" + label, color, metallic=0.12, roughness=0.28)
             shader = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
             shader.inputs["Emission Color"].default_value = color
-            shader.inputs["Emission Strength"].default_value = 0.35
-            if interaction_type == "SPIN":
-                bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=0.24, location=location)
-                obj = bpy.context.active_object
-                obj.name = "PHC_Interactive_" + label
-                _move_to_collection(obj, collection)
-                obj["phc_generated"] = True
-                obj["phc_scene_generated"] = True
-                obj.data.materials.append(material)
-            else:
-                obj = _link_box("PHC_Interactive_" + label, location, dimensions, collection, material)
+            shader.inputs["Emission Strength"].default_value = 0.28
+            obj = _link_box("PHC_Interactive_" + label, location, dimensions, collection, material)
             obj["phc_interactive"] = True
             obj["phc_interaction_type"] = interaction_type
+            obj["phc_collision_shape"] = "BOX"
+            obj["phc_collision_half_extents"] = [value * 0.5 for value in dimensions]
             obj["phc_base_location"] = list(location)
             obj["phc_active"] = False
-            obj["phc_bounce_start"] = -10.0
-            obj["phc_last_update"] = 0.0
-            obj["phc_last_trigger"] = -10.0
             obj["phc_velocity"] = [0.0, 0.0, 0.0]
             obj["phc_angular_velocity"] = [0.0, 0.0, 0.0]
-            if interaction_type == "SPIN":
-                obj["phc_collision_shape"] = "SPHERE"
-                obj["phc_collision_radius"] = 0.24
-            else:
-                obj["phc_collision_shape"] = "BOX"
-                obj["phc_collision_half_extents"] = [value * 0.5 for value in dimensions]
+            obj["phc_last_trigger"] = -10.0
+            obj["phc_grabable"] = True
             text_obj = _link_text("PHC_Label_" + label, label.upper(), (location[0], location[1] - 0.02, location[2] + 0.42), collection, material)
             text_obj.rotation_euler.x = math.radians(90.0)
 
-        punch_material = _make_material("PHC_Interactive_Punch", (1.0, 0.62, 0.08, 1.0), metallic=0.1, roughness=0.28)
+        punch_material = _make_material("PHC_Interactive_Punch", (1.0, 0.66, 0.10, 1.0), metallic=0.08, roughness=0.26)
         punch_shader = next(node for node in punch_material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
-        punch_shader.inputs["Emission Color"].default_value = (1.0, 0.35, 0.04, 1.0)
-        punch_shader.inputs["Emission Strength"].default_value = 0.35
-        punch_base = _link_box("PHC_PunchBase", (1.55, -0.20, 0.74), (0.22, 0.22, 0.08), collection, punch_material)
+        punch_shader.inputs["Emission Color"].default_value = (1.0, 0.40, 0.05, 1.0)
+        punch_shader.inputs["Emission Strength"].default_value = 0.28
+        punch_base = _link_box("PHC_PunchBase", (0.0, -0.16, 0.67), (0.18, 0.18, 0.14), collection, punch_material)
         punch_base["phc_collision_shape"] = "BOX"
-        punch_base["phc_collision_half_extents"] = [0.11, 0.11, 0.04]
+        punch_base["phc_collision_half_extents"] = [0.09, 0.09, 0.07]
 
-        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=0.24, location=(1.55, -0.20, 1.69))
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=0.25, location=(0.0, -0.16, 1.72))
         punch_ball = bpy.context.active_object
         punch_ball.name = "PHC_PunchBall"
         _move_to_collection(punch_ball, collection)
@@ -616,8 +648,8 @@ class PHC_OT_CreateFixedScene(Operator):
         punch_ball["phc_interactive"] = True
         punch_ball["phc_interaction_type"] = "PUNCH_BALL"
         punch_ball["phc_collision_shape"] = "SPHERE"
-        punch_ball["phc_collision_radius"] = 0.24
-        punch_ball["phc_base_location"] = [1.55, -0.20, 1.69]
+        punch_ball["phc_collision_radius"] = 0.25
+        punch_ball["phc_base_location"] = [0.0, -0.16, 1.72]
         punch_ball["phc_rest_offset"] = [0.0, 0.0, 1.17]
         punch_ball["phc_spring_stiffness"] = 45.0
         punch_ball["phc_spring_damping"] = 7.5
@@ -629,16 +661,15 @@ class PHC_OT_CreateFixedScene(Operator):
         punch_ball["phc_angular_velocity"] = [0.0, 0.0, 0.0]
         punch_ball.data.materials.append(punch_material)
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=0.045, depth=1.0, location=(1.55, -0.20, 1.215))
+        bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=0.045, depth=1.0, location=(0.0, -0.16, 1.195))
         punch_rod = bpy.context.active_object
         punch_rod.name = "PHC_PunchRod"
         _move_to_collection(punch_rod, collection)
         punch_rod["phc_generated"] = True
         punch_rod["phc_scene_generated"] = True
         punch_rod.data.materials.append(punch_material)
-        punch_label = _link_text("PHC_Label_Punch", "PUNCH", (1.55, -0.22, 2.02), collection, punch_material)
+        punch_label = _link_text("PHC_Label_Punch", "PUNCH", (0.0, -0.18, 2.08), collection, punch_material)
         punch_label.rotation_euler.x = math.radians(90.0)
-
 
         camera_data = bpy.data.cameras.new(FIXED_CAMERA_NAME + "Data")
         camera_data.lens = settings.camera_lens
@@ -653,21 +684,33 @@ class PHC_OT_CreateFixedScene(Operator):
         _look_at(camera, (0.0, stage_y, stage_z))
 
         key_data = bpy.data.lights.new("PHC_KeyLightData", type="AREA")
-        key_data.energy = 900.0
+        key_data.energy = 1200.0
         key_data.shape = "DISK"
-        key_data.size = 4.0
+        key_data.size = 4.5
+        key_data.use_shadow = True
         key = _link_object("PHC_KeyLight", key_data, collection)
         key["phc_scene_generated"] = True
-        key.location = (-3.5, -4.0, 5.0)
+        key.location = (-4.0, -4.0, 6.0)
         _look_at(key, (0.0, stage_y, stage_z))
 
         fill_data = bpy.data.lights.new("PHC_FillLightData", type="AREA")
-        fill_data.energy = 500.0
-        fill_data.size = 3.0
+        fill_data.energy = 650.0
+        fill_data.shape = "DISK"
+        fill_data.size = 5.0
+        fill_data.use_shadow = True
         fill = _link_object("PHC_FillLight", fill_data, collection)
         fill["phc_scene_generated"] = True
-        fill.location = (4.0, -2.0, 3.0)
+        fill.location = (4.5, -2.0, 3.8)
         _look_at(fill, (0.0, stage_y, stage_z))
+
+        rim_data = bpy.data.lights.new("PHC_RimLightData", type="AREA")
+        rim_data.energy = 480.0
+        rim_data.size = 4.0
+        rim_data.use_shadow = True
+        rim = _link_object("PHC_RimLight", rim_data, collection)
+        rim["phc_scene_generated"] = True
+        rim.location = (0.0, 3.0, 5.0)
+        _look_at(rim, (0.0, stage_y, stage_z))
 
         context.scene.camera = camera
         context.scene.render.resolution_x = 1920
@@ -675,6 +718,15 @@ class PHC_OT_CreateFixedScene(Operator):
         context.scene.render.resolution_percentage = 100
         context.scene.render.image_settings.file_format = "PNG"
         context.scene.render.fps = 60
+        context.scene.render.film_transparent = False
+        try:
+            context.scene.render.engine = "BLENDER_EEVEE_NEXT"
+        except Exception:
+            pass
+        try:
+            context.scene.view_settings.look = "AgX - Medium High Contrast"
+        except Exception:
+            pass
         context.scene.frame_start = 1
         context.scene.frame_end = 1000000
         context.scene.frame_set(1)
@@ -1097,7 +1149,7 @@ def _step_custom_physics(scene, now: float) -> None:
     if now - STATE.last_physics_step < 1.0 / 90.0:
         return
     STATE.last_physics_step = now
-    objects = [item for item in bpy.data.objects if item.get("phc_interactive") and item.get("phc_interaction_type") != "PUNCH_BALL"]
+    objects = [item for item in bpy.data.objects if item.get("phc_interactive") and item.get("phc_interaction_type") != "PUNCH_BALL" and not item.get("phc_held")]
     for obj in objects:
         velocity = Vector(obj.get("phc_velocity", (0.0, 0.0, 0.0)))
         velocity.z -= 9.81 * dt
@@ -1131,7 +1183,7 @@ def _step_custom_physics(scene, now: float) -> None:
             velocity.z = max(0.0, -velocity.z * 0.35)
         ball["phc_velocity"] = list(velocity)
 
-    dynamics = [item for item in bpy.data.objects if item.get("phc_interactive")]
+    dynamics = [item for item in bpy.data.objects if item.get("phc_interactive") and not item.get("phc_held")]
     for index, first in enumerate(dynamics):
         for second in dynamics[index + 1:]:
             delta = second.location - first.location
@@ -1153,6 +1205,97 @@ def _step_custom_physics(scene, now: float) -> None:
                 second["phc_velocity"] = list(second_velocity)
 
     _update_punch_rod()
+
+
+def _pinch_distance(hand: HandPacket) -> float:
+    return (landmark(hand.image, 4) - landmark(hand.image, 8)).length
+
+
+def _set_object_quaternion(obj, rotation: Quaternion) -> None:
+    if obj.rotation_mode == "QUATERNION":
+        obj.rotation_quaternion = rotation
+    else:
+        obj.rotation_euler = rotation.to_euler(obj.rotation_mode)
+
+
+def _release_grabbed_object(now: float) -> None:
+    name = STATE.grabbed_object_name
+    if not name:
+        return
+    obj = bpy.data.objects.get(name)
+    if obj is not None:
+        obj["phc_held"] = False
+        obj["phc_velocity"] = list(STATE.grab_velocity)
+        obj["phc_angular_velocity"] = list(STATE.grab_angular_velocity)
+        obj["phc_last_trigger"] = now
+    STATE.grabbed_object_name = ""
+    STATE.grab_side = ""
+    STATE.grab_velocity = Vector((0.0, 0.0, 0.0))
+    STATE.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
+
+
+def _update_grab(settings, hands, now: float) -> None:
+    if not settings.pickup_enabled:
+        if STATE.grabbed_object_name:
+            _release_grabbed_object(now)
+        return
+    hands_by_side = {side: hand for side, hand in hands}
+    if STATE.grabbed_object_name:
+        grabbed = bpy.data.objects.get(STATE.grabbed_object_name)
+        hand = hands_by_side.get(STATE.grab_side)
+        if grabbed is None or hand is None or _pinch_distance(hand) > settings.pickup_threshold:
+            _release_grabbed_object(now)
+            return
+        thumb = bpy.data.objects.get(f"PHC_{'L' if STATE.grab_side == 'LEFT' else 'R'}_Joint_04")
+        index = bpy.data.objects.get(f"PHC_{'L' if STATE.grab_side == 'LEFT' else 'R'}_Joint_08")
+        if thumb is None or index is None:
+            _release_grabbed_object(now)
+            return
+        point = (thumb.location + index.location) * 0.5
+        dt = 1.0 / max(1.0, bpy.context.scene.render.fps)
+        if STATE.grab_last_point is not None:
+            velocity = (point - STATE.grab_last_point) / dt
+            STATE.grab_velocity += (velocity - STATE.grab_velocity) * 0.35
+        palm_rotation = _palm_quaternion(hand, settings.mirror_x)
+        world_offset = palm_rotation @ STATE.grab_offset
+        grabbed.location = point + world_offset
+        target_rotation = palm_rotation @ STATE.grab_rotation_offset
+        previous_rotation = grabbed.rotation_quaternion.copy() if grabbed.rotation_mode == "QUATERNION" else grabbed.rotation_euler.to_quaternion()
+        _set_object_quaternion(grabbed, target_rotation)
+        STATE.grab_angular_velocity = (target_rotation @ previous_rotation.inverted()).to_euler()
+        STATE.grab_last_point = point.copy()
+        return
+
+    for side, hand in hands:
+        pinching = _pinch_distance(hand) <= settings.pickup_threshold
+        if pinching and not STATE.previous_pinch[side]:
+            thumb = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_04")
+            index = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_08")
+            if thumb is None or index is None:
+                continue
+            point = (thumb.location + index.location) * 0.5
+            candidates = []
+            for obj in (item for item in bpy.data.objects if item.get("phc_grabable") and not item.get("phc_held")):
+                distance = (obj.location - point).length - _collision_radius(obj)
+                if distance <= settings.pickup_radius:
+                    candidates.append((distance, obj))
+            if candidates:
+                distance, obj = min(candidates, key=lambda item: item[0])
+                palm_rotation = _palm_quaternion(hand, settings.mirror_x)
+                object_rotation = obj.rotation_quaternion.copy() if obj.rotation_mode == "QUATERNION" else obj.rotation_euler.to_quaternion()
+                STATE.grabbed_object_name = obj.name
+                STATE.grab_side = side
+                STATE.grab_offset = palm_rotation.inverted() @ (obj.location - point)
+                STATE.grab_rotation_offset = palm_rotation.inverted() @ object_rotation
+                STATE.grab_last_point = point.copy()
+                STATE.grab_velocity = Vector((0.0, 0.0, 0.0))
+                STATE.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
+                obj["phc_held"] = True
+                obj["phc_velocity"] = [0.0, 0.0, 0.0]
+                obj["phc_angular_velocity"] = [0.0, 0.0, 0.0]
+                settings.status = f"捏合拿起: {obj.name}"
+                break
+        STATE.previous_pinch[side] = pinching
 
 
 def _update_interactions(hands, settings, now: float) -> None:
@@ -1398,6 +1541,13 @@ class PHC_OT_ResetInteractions(Operator):
     bl_description = "恢复场景中交互物体的初始位置和状态"
 
     def execute(self, context):
+        STATE.grabbed_object_name = ""
+        STATE.grab_side = ""
+        STATE.grab_offset = Vector((0.0, 0.0, 0.0))
+        STATE.grab_rotation_offset = Quaternion((1.0, 0.0, 0.0, 0.0))
+        STATE.grab_last_point = None
+        STATE.grab_velocity = Vector((0.0, 0.0, 0.0))
+        STATE.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
         for obj in (item for item in bpy.data.objects if item.get("phc_interactive")):
             base = obj.get("phc_base_location", [obj.location.x, obj.location.y, obj.location.z])
             if obj.get("phc_interaction_type") == "PUNCH_BALL":
@@ -1450,6 +1600,9 @@ class PHC_PT_Main(Panel):
         scene_box.prop(settings, "hide_untracked_hands")
         scene_box.prop(settings, "interaction_enabled")
         scene_box.prop(settings, "pinch_threshold")
+        scene_box.prop(settings, "pickup_enabled")
+        scene_box.prop(settings, "pickup_threshold")
+        scene_box.prop(settings, "pickup_radius")
         scene_box.operator("phc.reset_interactions", icon="LOOP_BACK")
 
         box = layout.box()
