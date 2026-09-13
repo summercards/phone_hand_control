@@ -1140,8 +1140,16 @@ def _support_height(obj) -> float:
     half = Vector(obj.get("phc_collision_half_extents", (0.2, 0.2, 0.2)))
     radius = float(obj.get("phc_collision_radius", 0.0))
     half_height = radius if str(obj.get("phc_collision_shape", "SPHERE")) == "SPHERE" else half.z
-    on_table = -2.5 <= obj.location.x <= 2.5 and -1.25 <= obj.location.y <= 1.15
-    return (0.70 if on_table else 0.0) + half_height
+    platform = bpy.data.objects.get("PHC_Scene_Platform")
+    if platform is None:
+        return half_height
+    dimensions = platform.dimensions
+    on_platform = (
+        abs(obj.location.x - platform.location.x) <= dimensions.x * 0.5
+        and abs(obj.location.y - platform.location.y) <= dimensions.y * 0.5
+    )
+    top = platform.location.z + dimensions.z * 0.5 if on_platform else 0.0
+    return top + half_height
 
 
 def _step_custom_physics(scene, now: float) -> None:
