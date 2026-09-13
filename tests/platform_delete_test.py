@@ -19,6 +19,7 @@ bpy.ops.phc.create_fixed_scene()
 platform = bpy.data.objects.get("PHC_Scene_Platform")
 if platform is not None:
     bpy.data.objects.remove(platform, do_unlink=True)
+punch_base = bpy.data.objects["PHC_PunchBase"]
 obj = bpy.data.objects["PHC_Interactive_Toggle"]
 obj.location.z = 2.0
 obj["phc_velocity"] = [0.0, 0.0, 0.0]
@@ -27,7 +28,9 @@ for step in range(180):
     module._step_custom_physics(bpy.context.scene, start + step / 60.0)
 checks = {
     "deletion_safe": obj.location.z < 0.40,
+    "punch_base_on_floor": abs(punch_base.location.z - punch_base.dimensions.z * 0.5) < 0.02,
     "floor_height": round(obj.location.z, 3),
+    "punch_base_height": round(punch_base.location.z, 3),
 }
 if not checks["deletion_safe"]:
     raise RuntimeError(json.dumps(checks))

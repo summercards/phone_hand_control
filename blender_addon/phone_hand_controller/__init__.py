@@ -1157,6 +1157,13 @@ def _step_custom_physics(scene, now: float) -> None:
     if now - STATE.last_physics_step < 1.0 / 90.0:
         return
     STATE.last_physics_step = now
+    platform = bpy.data.objects.get("PHC_Scene_Platform")
+    punch_base = bpy.data.objects.get("PHC_PunchBase")
+    if punch_base is not None:
+        platform_top = 0.0
+        if platform is not None:
+            platform_top = platform.location.z + platform.dimensions.z * 0.5
+        punch_base.location.z = platform_top + punch_base.dimensions.z * 0.5
     objects = [item for item in bpy.data.objects if item.get("phc_interactive") and item.get("phc_interaction_type") != "PUNCH_BALL" and not item.get("phc_held")]
     for obj in objects:
         velocity = Vector(obj.get("phc_velocity", (0.0, 0.0, 0.0)))
