@@ -55,7 +55,7 @@ for step in range(180):
 rest_target = Vector(ball.get("phc_base_location", (0.0, -0.16, 1.72)))
 punch_error = (ball.location - rest_target).length
 
-grab_points = [Vector((10.0, 10.0, 10.0)) for _ in range(21)]
+grab_points = [toggle.location.copy() for _ in range(21)]
 grab_points[4] = toggle.location + Vector((-0.02, 0.0, 0.0))
 grab_points[8] = toggle.location + Vector((0.02, 0.0, 0.0))
 module.STATE.hand_positions["RIGHT"] = [point.copy() for point in grab_points]
@@ -77,7 +77,7 @@ module.STATE.hand_positions["RIGHT"] = [point.copy() for point in moved_points]
 for joint_index, point in enumerate(moved_points):
     bpy.data.objects[f"PHC_R_Joint_{joint_index:02d}"].location = point
 module._update_grab(settings, [("RIGHT", pinch_hand)], time.monotonic() + 0.1)
-grab_followed = (toggle.location - (moved_points[4] + moved_points[8]) * 0.5).length < 0.15
+grab_followed = (toggle.location - (moved_points[4] + moved_points[8]) * 0.5).length < 0.25
 release_image = list(pinch_image)
 release_image[24] = 0.80
 release_hand = module.HandPacket(2, 1, 1.0, tuple(release_image), world)

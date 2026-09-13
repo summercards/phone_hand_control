@@ -382,8 +382,8 @@ class PHCSettings(PropertyGroup):
     interaction_enabled: BoolProperty(name="启用手部体积碰撞", default=True)
     pinch_threshold: FloatProperty(name="击打力度阈值", default=0.35, min=0.02, max=3.0)
     pickup_enabled: BoolProperty(name="启用捏合拿取", default=True)
-    pickup_threshold: FloatProperty(name="拿取捏合阈值", default=0.065, min=0.02, max=0.16)
-    pickup_radius: FloatProperty(name="拿取距离", default=0.28, min=0.05, max=1.0)
+    pickup_threshold: FloatProperty(name="拿取捏合阈值", default=0.085, min=0.02, max=0.25)
+    pickup_radius: FloatProperty(name="拿取感应半径", default=0.60, min=0.10, max=2.0)
     min_cutoff: FloatProperty(name="静止稳定强度", default=1.15, min=0.05, max=10.0)
     speed_boost: FloatProperty(name="移动跟随强度", default=0.055, min=0.0, max=1.0)
     prediction_ms: FloatProperty(name="预测补偿 (ms)", default=0.0, min=0.0, max=30.0)
@@ -1223,7 +1223,18 @@ def _step_custom_physics(scene, now: float) -> None:
 
 
 def _pinch_distance(hand: HandPacket) -> float:
-    return (landmark(hand.image, 4) - landmark(hand.image, 8)).length
+    thumb = landmark(hand.image, 4)
+    index = landmark(hand.image, 8)
+    return Vector((thumb.x - index.x, thumb.y - index.y)).length
+
+
+def _grip_anchor(side: str):
+    positions = STATE.hand_positions.get(side)
+    if not positions or len(positions) < 21:
+        return None
+    palm = sum((positions[index] for index in PALM_INDEXES), Vector()) / len(PALM_INDEXES)
+    pinch = (positions[4] + positions[8]) * 0.5
+    return palm.lerp(pinch, 0.42)
 
 
 def _set_object_quaternion(obj, rotation: Quaternion) -> None:
@@ -1240,77 +1251,99 @@ def _release_grabbed_object(now: float) -> None:
     obj = bpy.data.objects.get(name)
     if obj is not None:
         obj["phc_held"] = False
+        obj["phc_grab_candidate"] = False
         obj["phc_velocity"] = list(STATE.grab_velocity)
         obj["phc_angular_velocity"] = list(STATE.grab_angular_velocity)
         obj["phc_last_trigger"] = now
     STATE.grabbed_object_name = ""
     STATE.grab_side = ""
+    STATE.grab_last_point = None
     STATE.grab_velocity = Vector((0.0, 0.0, 0.0))
     STATE.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
 
 
 def _update_grab(settings, hands, now: float) -> None:
+    hands_by_side = {side: hand for side, hand in hands}
+    for side in ("LEFT", "RIGHT"):
+        if side not in hands_by_side:
+            STATE.previous_pinch[side] = False
+    grabables = [obj for obj in bpy.data.objects if obj.get("phc_grabable")]
+    for obj in grabables:
+        obj["phc_grab_candidate"] = False
+
     if not settings.pickup_enabled:
         if STATE.grabbed_object_name:
             _release_grabbed_object(now)
         return
-    hands_by_side = {side: hand for side, hand in hands}
+
     if STATE.grabbed_object_name:
         grabbed = bpy.data.objects.get(STATE.grabbed_object_name)
         hand = hands_by_side.get(STATE.grab_side)
-        if grabbed is None or hand is None or _pinch_distance(hand) > settings.pickup_threshold:
+        if grabbed is None or hand is None:
             _release_grabbed_object(now)
             return
-        thumb = bpy.data.objects.get(f"PHC_{'L' if STATE.grab_side == 'LEFT' else 'R'}_Joint_04")
-        index = bpy.data.objects.get(f"PHC_{'L' if STATE.grab_side == 'LEFT' else 'R'}_Joint_08")
-        if thumb is None or index is None:
+        if _pinch_distance(hand) > settings.pickup_threshold * 1.8:
             _release_grabbed_object(now)
             return
-        point = (thumb.location + index.location) * 0.5
+        anchor = _grip_anchor(STATE.grab_side)
+        if anchor is None:
+            _release_grabbed_object(now)
+            return
         dt = 1.0 / max(1.0, bpy.context.scene.render.fps)
         if STATE.grab_last_point is not None:
-            velocity = (point - STATE.grab_last_point) / dt
+            velocity = (anchor - STATE.grab_last_point) / dt
             STATE.grab_velocity += (velocity - STATE.grab_velocity) * 0.35
         palm_rotation = _palm_quaternion(hand, settings.mirror_x)
-        world_offset = palm_rotation @ STATE.grab_offset
-        grabbed.location = point + world_offset
-        target_rotation = palm_rotation @ STATE.grab_rotation_offset
+        grabbed.location = anchor + palm_rotation @ STATE.grab_offset
         previous_rotation = grabbed.rotation_quaternion.copy() if grabbed.rotation_mode == "QUATERNION" else grabbed.rotation_euler.to_quaternion()
+        target_rotation = (palm_rotation @ STATE.grab_rotation_offset).normalized()
         _set_object_quaternion(grabbed, target_rotation)
-        STATE.grab_angular_velocity = (target_rotation @ previous_rotation.inverted()).to_euler()
-        STATE.grab_last_point = point.copy()
+        delta_rotation = target_rotation @ previous_rotation.inverted()
+        STATE.grab_angular_velocity += (Vector(delta_rotation.to_euler()) / dt - STATE.grab_angular_velocity) * 0.35
+        STATE.grab_last_point = anchor.copy()
+        grabbed["phc_grab_candidate"] = True
+        STATE.previous_pinch[STATE.grab_side] = True
         return
 
+    nearest = None
+    pinch_states = {}
     for side, hand in hands:
+        anchor = _grip_anchor(side)
+        if anchor is None:
+            continue
         pinching = _pinch_distance(hand) <= settings.pickup_threshold
-        if pinching and not STATE.previous_pinch[side]:
-            thumb = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_04")
-            index = bpy.data.objects.get(f"PHC_{'L' if side == 'LEFT' else 'R'}_Joint_08")
-            if thumb is None or index is None:
+        pinch_states[side] = pinching
+        for obj in grabables:
+            if obj.get("phc_held"):
                 continue
-            point = (thumb.location + index.location) * 0.5
-            candidates = []
-            for obj in (item for item in bpy.data.objects if item.get("phc_grabable") and not item.get("phc_held")):
-                distance = (obj.location - point).length - _collision_radius(obj)
-                if distance <= settings.pickup_radius:
-                    candidates.append((distance, obj))
-            if candidates:
-                distance, obj = min(candidates, key=lambda item: item[0])
-                palm_rotation = _palm_quaternion(hand, settings.mirror_x)
-                object_rotation = obj.rotation_quaternion.copy() if obj.rotation_mode == "QUATERNION" else obj.rotation_euler.to_quaternion()
-                STATE.grabbed_object_name = obj.name
-                STATE.grab_side = side
-                STATE.grab_offset = palm_rotation.inverted() @ (obj.location - point)
-                STATE.grab_rotation_offset = palm_rotation.inverted() @ object_rotation
-                STATE.grab_last_point = point.copy()
-                STATE.grab_velocity = Vector((0.0, 0.0, 0.0))
-                STATE.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
-                obj["phc_held"] = True
-                obj["phc_velocity"] = [0.0, 0.0, 0.0]
-                obj["phc_angular_velocity"] = [0.0, 0.0, 0.0]
-                settings.status = f"捏合拿起: {obj.name}"
-                break
-        STATE.previous_pinch[side] = pinching
+            distance = (obj.location - anchor).length - _collision_radius(obj)
+            if distance <= settings.pickup_radius * 1.25:
+                obj["phc_grab_candidate"] = True
+            if distance <= settings.pickup_radius:
+                candidate = (distance, side, hand, obj, anchor)
+                if nearest is None or distance < nearest[0]:
+                    nearest = candidate
+
+    if nearest is not None:
+        distance, side, hand, obj, anchor = nearest
+        if pinch_states.get(side, False) and not STATE.previous_pinch[side]:
+            palm_rotation = _palm_quaternion(hand, settings.mirror_x)
+            object_rotation = obj.rotation_quaternion.copy() if obj.rotation_mode == "QUATERNION" else obj.rotation_euler.to_quaternion()
+            STATE.grabbed_object_name = obj.name
+            STATE.grab_side = side
+            STATE.grab_offset = palm_rotation.inverted() @ (obj.location - anchor)
+            STATE.grab_rotation_offset = (palm_rotation.inverted() @ object_rotation).normalized()
+            STATE.grab_last_point = anchor.copy()
+            STATE.grab_velocity = Vector((0.0, 0.0, 0.0))
+            STATE.grab_angular_velocity = Vector((0.0, 0.0, 0.0))
+            obj["phc_held"] = True
+            obj["phc_active"] = True
+            obj["phc_grab_candidate"] = True
+            obj["phc_velocity"] = [0.0, 0.0, 0.0]
+            obj["phc_angular_velocity"] = [0.0, 0.0, 0.0]
+            settings.status = f"已拿起: {obj.name}"
+            pinch_states[side] = True
+    STATE.previous_pinch.update(pinch_states)
 
 
 def _update_interactions(hands, settings, now: float) -> None:
@@ -1343,7 +1376,8 @@ def _update_interactions(hands, settings, now: float) -> None:
             material = obj.data.materials[0]
             shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None) if material.use_nodes else None
             if shader is not None:
-                shader.inputs["Emission Strength"].default_value = 7.0 if best_hit is not None else (2.5 if active else 0.35)
+                highlighted = best_hit is not None or bool(obj.get("phc_grab_candidate"))
+                shader.inputs["Emission Strength"].default_value = 7.0 if highlighted else (2.5 if active else 0.35)
     _step_custom_physics(scene, now)
 
 
