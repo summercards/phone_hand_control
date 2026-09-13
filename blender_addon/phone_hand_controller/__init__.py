@@ -331,6 +331,8 @@ class RuntimeState:
         self.hand_positions: dict[str, list[Vector]] = {}
         self.hand_previous_positions: dict[str, list[Vector]] = {}
         self.last_physics_step = 0.0
+        self.last_exception = ""
+
         self.finger_bindings: dict[str, dict[str, dict[str, object]]] = {}
 
 STATE = RuntimeState()
@@ -404,8 +406,8 @@ class PHC_OT_StartReceiver(Operator):
             return {"CANCELLED"}
         STATE.last_status = f"监听 UDP {settings.receive_port}"
         settings.status = STATE.last_status
-        if not bpy.app.timers.is_registered(controller_timer):
-            bpy.app.timers.register(controller_timer, first_interval=0.0, persistent=True)
+        if not bpy.app.timers.is_registered(controller_timer_safe):
+            bpy.app.timers.register(controller_timer_safe, first_interval=0.0, persistent=True)
         self.report({"INFO"}, f"等待 Bridge 端口 {settings.receive_port}")
         return {"FINISHED"}
 
@@ -420,8 +422,8 @@ class PHC_OT_StopReceiver(Operator):
             STATE.receiver.stop()
             STATE.receiver.join(timeout=0.3)
         STATE.receiver = None
-        if bpy.app.timers.is_registered(controller_timer):
-            bpy.app.timers.unregister(controller_timer)
+        if bpy.app.timers.is_registered(controller_timer_safe):
+            bpy.app.timers.unregister(controller_timer_safe)
         context.scene.phone_hand_control.status = "已停止"
         _tag_redraw()
         return {"FINISHED"}
@@ -855,7 +857,9 @@ class PHC_OT_Calibrate(Operator):
 
 def _origin_delta(side: str, hand: HandPacket, settings, calibration) -> Vector:
     current = palm_center(hand.image)
-    reference = calibration.get("origin") if calibration else Vector((0.5, 0.5, 0.0))
+    reference = calibration.get("origin") if calibration else None
+    if reference is None:
+        reference = Vector((0.5, 0.5, 0.0))
     if not calibration:
         calibration = STATE.calibration.setdefault(side, {})
     else:
@@ -1308,6 +1312,16 @@ def _update_armature_hand(side: str, hand: HandPacket, settings) -> None:
         pose_bone.keyframe_insert("rotation_quaternion", frame=bpy.context.scene.frame_current)
 
 
+def controller_timer_safe():
+    try:
+        return controller_timer()
+    except Exception:
+        import traceback
+        STATE.last_exception = traceback.format_exc()
+        print(STATE.last_exception, flush=True)
+        return 1.0 / 60.0
+
+
 def _select_hand(packet: PosePacket, side: str, swap: bool) -> HandPacket | None:
     sensor_side = side
     if swap:
@@ -1496,8 +1510,8 @@ def register():
 
 
 def unregister():
-    if bpy.app.timers.is_registered(controller_timer):
-        bpy.app.timers.unregister(controller_timer)
+    if bpy.app.timers.is_registered(controller_timer_safe):
+        bpy.app.timers.unregister(controller_timer_safe)
     if STATE.receiver is not None:
         STATE.receiver.stop()
         STATE.receiver.join(timeout=0.3)

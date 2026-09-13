@@ -13,6 +13,11 @@ if not module_path.exists():
 
 enabled = False
 try:
+    addon_utils.disable(module_name, default_set=True)
+except Exception:
+    pass
+sys.modules.pop(module_name, None)
+try:
     addon_utils.enable(module_name, default_set=True, persistent=True)
     enabled = bool(addon_utils.check(module_name)[1])
 except Exception as exc:

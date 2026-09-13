@@ -36,7 +36,10 @@ reference_spread = module.palm_scale(reference.image, reference.world)
 calibration = {"origin": Vector((0.5, 0.5, 0.0)), "palm_spread": reference_spread}
 far = module._origin_delta("RIGHT", scaled_hand(0.80, 0.08), settings, dict(calibration))
 near = module._origin_delta("RIGHT", scaled_hand(1.25, 0.08), settings, dict(calibration))
+missing_origin = module._origin_delta("RIGHT", scaled_hand(1.0, 0.08), settings, {"palm_spread": reference_spread})
+
 checks = {
+    "missing_origin_guard": isinstance(missing_origin.x, float),
     "far_moves_away": far.y > 0.02,
     "near_moves_toward_camera": near.y < -0.02,
 }
